@@ -1,14 +1,13 @@
 
-
-cd /mnt/petrelfs/yejinhui/Projects/starVLA
+cd /home/liwenbo/projects/VLA/starVLA
 export PYTHONPATH=$(pwd):${PYTHONPATH}
 
 port=6678
-gpu_id=2
+gpu_id=4
 # export DEBUG=true
-export star_vla_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/starVLA/bin/python
+export star_vla_python=/home/liwenbo/anaconda3/envs/starVLA/bin/python
 
-your_ckpt=./results/Checkpoints/1208_bridge_rt_1_Qwen3PI/final_model/pytorch_model.pt
+your_ckpt=/home/liwenbo/projects/VLA/starVLA/playground/Pretrained_models/Qwen3VL-GR00T-Bridge-RT-1/checkpoints/steps_20000_pytorch_model.pt
 
 #### build output directory #####
 ckpt_dir=$(dirname "${your_ckpt}")
@@ -17,6 +16,7 @@ ckpt_name="${ckpt_base%.*}"
 output_server_dir="${ckpt_dir}/output_server"
 mkdir -p "${output_server_dir}"
 log_file="${output_server_dir}/${ckpt_name}_policy_server_${port}.log"
+# .../checkpoints/output_server/steps_20000_pytorch_model_policy_server_6678.log
 
 
 #### run server #####

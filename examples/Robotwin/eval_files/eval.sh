@@ -1,6 +1,6 @@
 #!/bin/bash
 
-ROBOTWIN_PATH=/mnt/data/gaoning/code_repos/RoboTwin
+ROBOTWIN_PATH=/home/liwenbo/projects/environment/RoboTwin
 
 policy_name="model2robotwin_interface"
 task_name=${1}
@@ -32,3 +32,5 @@ python script/eval_policy.py --config $DEPLOY_POLICY_PATH \
     --ckpt_setting ${ckpt_setting} \
     --seed ${seed} \
     --policy_name ${policy_name}
+
+#  Demo : bash eval.sh beat_block_hammer demo_clean starvla_demo 0 0

@@ -9,14 +9,14 @@
     "train_batch_size": "auto",
     "gradient_accumulation_steps": 1,
     "zero_optimization": {
-        "stage": 2,
+        "stage": 3,
         "allgather_partitions": true,
         "allgather_bucket_size": 5e8,
         "reduce_scatter": true,
         "reduce_bucket_size": 5e8,
         "overlap_comm": true,
         "contiguous_gradients": true,
-        "cpu_offload": false
+        "cpu_offload": true
     },
     "gradient_clipping": 1.0,
     "steps_per_print": 10

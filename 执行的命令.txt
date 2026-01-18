@@ -1,0 +1,18 @@
+
+
+
+The following information is stored in the config file: /home/liwenbo/projects/environment/LIBERO/config.yaml
+
+ls -ld \
+  /home/liwenbo/projects/environment/LIBERO/libero/libero \
+  /home/liwenbo/projects/environment/LIBERO/libero/libero/assets \
+  /home/liwenbo/projects/environment/LIBERO/libero/libero/bddl_files \
+  /home/liwenbo/projects/environment/LIBERO/libero/libero/init_files \
+  /home/liwenbo/projects/environment/LIBERO/libero/datasets
+
+python -m pip install -U --force-reinstall "torch==2.5.1" "torchvision==0.20.1" --index-url https://download.pytorch.org/whl/cu121
+
+/mnt/data/liwenbo_datas
+
+
+

@@ -2,8 +2,8 @@ run_id: starvla
 run_root_dir: results/Checkpoints
 seed: 42
 trackers: [jsonl, wandb]
-wandb_entity: your_wandb_entity
-wandb_project: llavavla
+wandb_entity: 1962672280-south-china-university-of-technology
+wandb_project: starVLA
 is_debug: false
 
 

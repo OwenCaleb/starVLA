@@ -1,8 +1,8 @@
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
-export LIBERO_HOME=/mnt/petrelfs/share/yejinhui/Projects/LIBERO  # Root directory of the LIBERO project
-export LIBERO_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/lerobot/bin/python  # Path to the Python environment
-export starVLA_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/starVLA/bin/python  # Path to the Python environment
+export LIBERO_HOME=/home/liwenbo/projects/environment/LIBERO  # Root directory of the LIBERO project
+export LIBERO_python=/home/liwenbo/anaconda3/envs/starVLA/bin/python  # Path to the Python environment
+export starVLA_python=/home/liwenbo/anaconda3/envs/starVLA/bin/python  # Path to the Python environment
 
 # === End of environment variable configuration ===
 export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero  # Path to LIBERO configuration files

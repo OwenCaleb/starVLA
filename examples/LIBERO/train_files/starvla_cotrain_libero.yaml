@@ -2,15 +2,16 @@ run_id: starvla
 run_root_dir: results/Checkpoints
 seed: 42
 trackers: [jsonl, wandb]
-wandb_entity: your_wandb_entity
-wandb_project: llavavla
+wandb_entity: 1962672280-south-china-university-of-technology
+wandb_project: starVLA
 is_debug: false
 
 
 framework:
-  name: QwenGR00T
+  name: QwenOFT
   qwenvl:
-    base_vlm: ./playground/Pretrained_models/Qwen2.5-VL-3B-Instruct-Action
+    # base_vlm: ./playground/Pretrained_models/Qwen2.5-VL-3B-Instruct-Action 
+    base_vlm: ./playground/Pretrained_models/Qwen2.5-VL-3B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
   dino:
@@ -58,7 +59,8 @@ datasets:
     min_pixels: 784
     model_max_length: 2048
     model_type: qwen2.5vl
-    per_device_batch_size: 4
+    # per_device_batch_size: 16
+    per_device_batch_size: 1
 
   vla_data:
     dataset_py: lerobot_datasets
@@ -68,7 +70,8 @@ datasets:
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     CoT_answer: bbox
     default_image_resolution: [3, 224, 224]
-    per_device_batch_size: 16
+    #  1
+    per_device_batch_size: 1
     load_all_data_for_training: true
     obs: ["image_0"]
     video_backend: torchvision_av
