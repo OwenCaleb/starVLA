@@ -427,7 +427,7 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
+            # self.optimizer.zero_grad()
 
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -439,13 +439,22 @@ class VLATrainer(TrainerUtils):
             # VLA backward propagation
             self.accelerator.backward(total_loss)
 
-            # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+            # 只有在真正的优化步（即累积满了）才做这些
+            if self.accelerator.sync_gradients:
+                if self.config.trainer.gradient_clipping is not None:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
-            # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)  # 更省显存/更快
+                
+            # # gradient clipping
+            # if self.config.trainer.gradient_clipping is not None:
+            #     self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+
+            # # optimizer step
+            # self.optimizer.step()
+            # self.lr_scheduler.step()
 
         return {
             "action_dit_loss": action_loss.item(),

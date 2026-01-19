@@ -14,5 +14,7 @@ python -m pip install -U --force-reinstall "torch==2.5.1" "torchvision==0.20.1" 
 
 /mnt/data/liwenbo_datas
 
-
+git remote -v
+git fetch upstream
+git merge upstream/starVLA
 

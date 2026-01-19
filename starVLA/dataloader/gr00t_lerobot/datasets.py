@@ -74,9 +74,9 @@ def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     all_low_dim_data_list = []
     # Collect all the data
     # parquet_paths = parquet_paths[:3]
-    for parquet_path in tqdm(
-        sorted(list(parquet_paths)),
-        desc="Collecting all parquet files...",
+    for parquet_path in tqdm(            # 使用 tqdm 包装循环，显示进度条
+        sorted(list(parquet_paths)), # 1. 转换为列表 2. 排序 3. 遍历
+        desc="Collecting all parquet files...",  # 进度条描述文字
     ):
         # Load the parquet file
         parquet_data = pd.read_parquet(parquet_path)

@@ -188,7 +188,7 @@ class TrainerUtils:
                     continue
 
         # accelerator.wait_for_everyone()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if dist.get_rank() == 0:
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -284,6 +284,7 @@ class TrainerUtils:
     @staticmethod
     def euclidean_distance(predicted: np.ndarray, ground_truth: np.ndarray) -> float:
         return np.linalg.norm(predicted - ground_truth)
+        # Linear Algebra Norm ——“线性代数中的范数”
 
     @staticmethod
     def _reset_dataloader(dataloader, epoch_counter):
@@ -306,6 +307,9 @@ class TrainerUtils:
         return:
             mean_angle_deg: average angle (degrees)
             angle_variance: angle variance
+        这意味着它只抽样前 32 行、前 7 列（总共 32 个小向量，每个维度 7），而不是用整个 2048×11008 的超高维梯度。
+        原因：高维下余弦相似度容易数值不稳定、也没必要全量计算。
+        用 PCGrad、GradNorm、MGDA 等方法处理冲突
         """
         angle_degs = []
 
@@ -355,6 +359,8 @@ class TrainerUtils:
         if the dot product of two groups of gradients < 0, then:
             grads_v <- grads_v - (dot / ||grads_a||^2) * grads_a
         return the new grads_v list
+        Projected Conflicting Gradient
+        当两组梯度整体上“冲突”（点积为负）时，把 grads_v 在 grads_a 的方向上那部分“反向成分”投影掉，从而减少负迁移。
         """
         # first compute dot and ||grads_a||^2
         dot, norm_a_sq = 0.0, 0.0
