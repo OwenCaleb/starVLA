@@ -8,7 +8,7 @@ import argparse
 from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
 from starVLA.model.framework.base_framework import baseframework
 import torch, os
-
+from deployment.model_server.adapters.starvla_adapter import StarVLAAdapter
 
 def main(args) -> None:
     # Example usage:
@@ -16,13 +16,12 @@ def main(args) -> None:
     # server = WebsocketPolicyServer(policy, host="localhost", port=10091)
     # server.serve_forever()
 
-    vla = baseframework.from_pretrained( # TODO should auto detect framework from model path
-        args.ckpt_path,
-    )
-
-    if args.use_bf16: # False
-        vla = vla.to(torch.bfloat16)
-    vla = vla.to("cuda").eval()
+    
+    adapter = StarVLAAdapter(
+        ckpt_path=args.ckpt_path,
+        use_bf16=args.use_bf16,
+        device="cuda",
+    ).load()
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -30,7 +29,7 @@ def main(args) -> None:
 
     # start websocket server
     server = WebsocketPolicyServer(
-        policy=vla,
+        policy=adapter,
         host="0.0.0.0",
         port=args.port,
         idle_timeout=args.idle_timeout,
