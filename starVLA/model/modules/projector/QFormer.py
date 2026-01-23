@@ -27,6 +27,7 @@ class CrossAttentionBlock(nn.Module):
             query (Tensor): Shape [B, Q, D]. Learnable query tokens propagated across layers.
             encoder_hidden_state (Tensor): Shape [B, L, D]. Features from one encoder layer.
             encoder_attention_mask (Tensor | None): Shape [B, L]. 1/True=keep (visible), 0/False=mask. None disables masking.
+            这里似乎有问题，0表示keep，1表示mask
         Returns:
             Tensor: Updated query tokens of shape [B, Q, D].
         Details:
@@ -38,7 +39,9 @@ class CrossAttentionBlock(nn.Module):
         kv = encoder_hidden_state
 
         if encoder_attention_mask is not None:
-            attn_mask = encoder_attention_mask.unsqueeze(1).to(dtype=torch.bool)  # [B, 1, L]
+            # 通常外部传入的是：padding位置为True/1，真实token为False/0
+            attn_mask = encoder_attention_mask.to(dtype=torch.bool)
+            # attn_mask = encoder_attention_mask.unsqueeze(1).to(dtype=torch.bool)  # [B, 1, L]
         else:
             attn_mask = None
 
