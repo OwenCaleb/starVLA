@@ -223,7 +223,12 @@ class TrainerUtils:
         if dist.get_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            if _is_safetensors_path(checkpoint_path):
+                from safetensors.torch import load_file
+
+                checkpoint = load_file(checkpoint_path)
+            else:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu")
         except Exception as e:
             raise RuntimeError(f"❌ loading checkpoint failed: {e}")
 
@@ -469,10 +474,10 @@ class TrainerUtils:
             self.accelerator.print(f"No checkpoint directory found at {checkpoint_dir}")
             return None, 0
 
-        # 获取所有符合命名规则，确保只匹配以 .pt 结尾的文件
+        # 获取所有符合命名规则，支持 .pt 和 .safetensors
         checkpoints = [
             f for f in os.listdir(checkpoint_dir) 
-            if re.match(r"steps_(\d+)_pytorch_model\.pt$", f)  # 添加 $ 确保以 .pt 结尾
+            if re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", f)
             and os.path.isfile(os.path.join(checkpoint_dir, f))  # 确保是文件
         ]
 
@@ -483,7 +488,7 @@ class TrainerUtils:
         # 提取步数并排序
         try:
             checkpoints_with_steps = [
-                (ckpt, int(re.search(r"steps_(\d+)_pytorch_model\.pt", ckpt).group(1)))
+                (ckpt, int(re.search(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", ckpt).group(1)))
                 for ckpt in checkpoints
             ]
         except AttributeError as e:
@@ -504,3 +509,8 @@ import os
 def is_main_process():
     rank = int(os.environ.get("RANK", 0))  # if RANK is not set, default to 0
     return rank == 0
+
+
+def _is_safetensors_path(path):
+    """Check if a path refers to a safetensors file."""
+    return str(path).endswith(".safetensors")

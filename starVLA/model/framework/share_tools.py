@@ -225,8 +225,9 @@ def read_model_config(pretrained_checkpoint):
     if os.path.isfile(pretrained_checkpoint):
         overwatch.info(f"Loading from local checkpoint path `{(checkpoint_pt := Path(pretrained_checkpoint))}`")
 
-        # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
-        assert checkpoint_pt.suffix == ".pt"
+        # [Validate] Checkpoint Path should look like
+        # `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt|.safetensors`
+        assert checkpoint_pt.suffix in {".pt", ".safetensors"}
         run_dir = checkpoint_pt.parents[1]
 
         # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
@@ -263,8 +264,9 @@ def read_mode_config(pretrained_checkpoint):
     if os.path.isfile(pretrained_checkpoint):
         overwatch.info(f"Loading from local checkpoint path `{(checkpoint_pt := Path(pretrained_checkpoint))}`")
 
-        # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
-        assert checkpoint_pt.suffix == ".pt"
+        # [Validate] Checkpoint Path should look like
+        # `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt|.safetensors`
+        assert checkpoint_pt.suffix in {".pt", ".safetensors"}
         run_dir = checkpoint_pt.parents[1]
 
         # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
