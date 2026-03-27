@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+'''
+ActionEncoder module for encoding action sequences with time information using sinusoidal positional encoding.
+'''
+
 import torch
 import torch.nn as nn
 
@@ -40,11 +44,16 @@ class SinusoidalPositionalEncoding(nn.Module):
         device = timesteps.device
 
         half_dim = self.embedding_dim // 2
-        # typical log space frequencies for sinusoidal encoding
+        # typical log space frequencies for sinusoidal encoding 区间均匀铺在[0, -log(10000)]
         exponent = -torch.arange(half_dim, dtype=torch.float, device=device) * (
             torch.log(torch.tensor(10000.0)) / half_dim
         )
         # Expand timesteps to (B, T, 1) then multiply
+        # [1,
+        #     10000^(-1/half_dim),
+        #     10000^(-2/half_dim),
+        #     ...
+        # ]
         freqs = timesteps.unsqueeze(-1) * exponent.exp()  # (B, T, half_dim)
 
         sin = torch.sin(freqs)

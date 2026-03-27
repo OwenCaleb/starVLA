@@ -39,7 +39,7 @@ class CrossAttentionBlock(nn.Module):
         kv = encoder_hidden_state
 
         if encoder_attention_mask is not None:
-            # 通常外部传入的是：padding位置为True/1，真实token为False/0
+            # 通常外部传入的是：padding位置为True/1，真实token为False/0 现在加不加~还难说
             attn_mask = encoder_attention_mask.to(dtype=torch.bool)
             # attn_mask = encoder_attention_mask.unsqueeze(1).to(dtype=torch.bool)  # [B, 1, L]
         else:
@@ -174,8 +174,7 @@ def get_layerwise_qformer(num_heads=8, config=None, **kwargs):
     num_layers = qformer_cfg.qformer_end_layer - qformer_cfg.qformer_start_layer if config else num_layers
     num_query_tokens = qformer_cfg.num_query_tokens
     input_hidden_dim = config.framework.layer_qformer.input_dim
-    output_hidden_dim = config.framework.layer_qformer.ouptput_dim
-    num_query_tokens = qformer_cfg.num_query_tokens
+    output_hidden_dim = config.framework.layer_qformer.output_dim
 
     qformer = LayerwiseQFormer(
         input_hidden_dim=input_hidden_dim,

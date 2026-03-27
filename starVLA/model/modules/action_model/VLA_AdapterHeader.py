@@ -139,6 +139,7 @@ class MLPResNet(nn.Module):
         x = self.relu(x)
         
         for i, block in enumerate(self.mlp_resnet_blocks):
+            # 故意跳过了第 0 层 hidden。
             idx = i + 1
             
             cur_h_t = None
@@ -188,6 +189,10 @@ class RotaryPositionEmbedding(nn.Module):
 class MLPResNetBlock(nn.Module):
     """
     Standard MLP ResNet Block.
+    x：当前要被更新的 action latent / action token 序列 [B, T, C]
+    h_t：任务相关特征，代码里实际上主要是 vision/task hidden states
+    h_a：action query 相关特征 VLM/adapter 那边传来的 动作相关 query 特征
+    p：proprioception，本体状态
     """
     def __init__(self, dim):
         super().__init__()
@@ -199,10 +204,12 @@ class MLPResNetBlock(nn.Module):
         )
         self.num_heads = 8
         self.head_dim = dim // self.num_heads
+        # self / task / cond 共用同一套 k_proj 和 v_proj 来节省参数，q_proj 也单独一套，因为 query 只来自 x。
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         self.o_proj = nn.Linear(dim, dim)
+        # 一开始不起作用，慢慢学习到合适的 gating_factor 来平衡条件信息的利用程度
         self.gating_factor = nn.Parameter(torch.zeros(1))
 
     def forward(self, x, h_t=None, h_a=None, p=None):
@@ -232,15 +239,21 @@ class MLPResNetBlock(nn.Module):
         v_tokens = self.v_proj(x)
 
         # Reshape Self
+        '''
+        q_1: [4, 64, 512]
+        → [4, 64, 8, 64]
+        → [4, 8, 64, 64]
+        '''
         q_1 = q_1.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k_tokens = k_tokens.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v_tokens = v_tokens.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_scores_list = []
         # Score: Self
+        # [B, H, T, Dh] @ [B, H, Dh, T] = [B, H, T, T] QK^T
         attn_scores_list.append(torch.matmul(q_1, k_tokens.transpose(-2, -1)))
 
-        # Process Task (Vision)
+        # Process Task (Vision) 每个 action latent token 去看所有视觉 token
         v_task_reshaped = None
         if h_t is not None:
             k_task = self.k_proj(h_t)
@@ -260,6 +273,38 @@ class MLPResNetBlock(nn.Module):
 
             attn_scores_list.append(torch.matmul(q_1, k_cond.transpose(-2, -1)) * ratio_g)
 
+
+        '''
+        self 分支
+        始终存在，保证 action latent 自己能稳定演化
+        task 分支
+        始终存在，保证能看视觉任务信息
+        cond 分支
+        通过 ratio_g 控制强度
+        '''
+        
+        '''
+        score部分:
+        self score   [2,8,64,64]
+        task score   [2,8,64,256]
+        cond score   [2,8,64,9]
+        ↓ cat(dim=-1)
+        attn_scores  [2,8,64,329]
+        ↓ softmax(dim=-1)
+        attn_weights [2,8,64,329]
+
+        value部分:
+        v_tokens         [2,8,64,64]
+        v_task_reshaped  [2,8,256,64]
+        v_cond_reshaped  [2,8,9,64]
+        ↓ cat(dim=2)
+        v_combined       [2,8,329,64]
+
+        矩阵乘:
+        [2,8,64,329] @ [2,8,329,64]
+        = [2,8,64,64]
+        '''
+        
         # Softmax
         attn_scores = torch.cat(attn_scores_list, dim=-1)
         attn_scores = attn_scores / math.sqrt(self.head_dim)
@@ -284,6 +329,10 @@ class MLPResNetBlock(nn.Module):
 class MLPResNetBlock_Pro(nn.Module):
     """
     MLP ResNet Block Pro with RoPE and dimension checks.
+    区分：
+        1. Self / Adapter / Task 分开参数化，更灵活地控制不同信息源的影响力
+        2. Self / Adapter / Task 都加 RoPE，保持位置信息一致性
+        3. 门控分支只作用于 Task 
     """
     def __init__(self, dim, num_heads=8):
         super().__init__()

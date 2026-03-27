@@ -12,6 +12,7 @@ from torchvision import transforms
 class GaussianBlur(transforms.RandomApply):
     """
     Apply Gaussian Blur to the PIL image.
+    以 1-p 的概率模糊
     """
 
     def __init__(self, *, p: float = 0.5, radius_min: float = 0.1, radius_max: float = 2.0):
@@ -39,6 +40,7 @@ class MaybeToTensor(transforms.ToTensor):
 
 
 # Use timm's names
+# 经典的 ImageNet evaluation recipe
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
@@ -60,6 +62,7 @@ def make_classification_train_transform(
     mean: Sequence[float] = IMAGENET_DEFAULT_MEAN,
     std: Sequence[float] = IMAGENET_DEFAULT_STD,
 ):
+    # 面积：是原图的一个比例（默认 8% ~ 100%） 长宽比：随机（默认 3/4 ~ 4/3）
     transforms_list = [transforms.RandomResizedCrop(crop_size, interpolation=interpolation)]
     if hflip_prob > 0.0:
         transforms_list.append(transforms.RandomHorizontalFlip(hflip_prob))
@@ -83,8 +86,8 @@ def make_classification_eval_transform(
     std: Sequence[float] = IMAGENET_DEFAULT_STD,
 ) -> transforms.Compose:
     transforms_list = [
-        transforms.Resize(resize_size, interpolation=interpolation),
-        transforms.CenterCrop(crop_size),
+        transforms.Resize(resize_size, interpolation=interpolation), # 把短边缩放到 256，长边按比例缩放。
+        transforms.CenterCrop(crop_size), # 从中心裁剪出 224x224 的区域
         MaybeToTensor(),
         make_normalize_transform(mean=mean, std=std),
     ]

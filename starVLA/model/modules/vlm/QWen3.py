@@ -111,6 +111,14 @@ class _QWen3_VL_Interface(nn.Module):
         """
         Build model inputs from raw data (images + instructions + optional solutions).
         Follow Oficial Qwen3-VL Instruct format: https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
+        images = [
+            [img1_a, img1_b, img1_c],   # 第1个样本多视角图
+            [img2_a, img2_b, img2_c],   # 第2个样本多视角图
+        ]
+        instructions = [
+            "pick up the cup",
+            "put the apple into the basket"
+        ]
         """
 
         # Create messages: one message per sample
@@ -189,3 +197,7 @@ if __name__ == "__main__":
     cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Qwen3-VL-4B-Instruct"
     qwen_vl = _QWen3_VL_Interface(cfg)
     pass
+
+# 使用到的配置文件字段：
+# cfg.framework.qwenvl.base_vlm
+# cfg.datasets.vla_data.CoT_prompt

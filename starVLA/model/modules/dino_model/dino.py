@@ -34,7 +34,7 @@ class DINOv2BackBone(nn.Module):
     Thin wrapper around a DINOv2 model.
 
     Args:
-        backone_name: DINOv2 model id (e.g. dinov2_vits14, dinov2_vitb14).
+        backbone_name: DINOv2 model id (e.g. dinov2_vits14, dinov2_vitb14).
         output_channels: (Unused placeholder; retained for future extension).
 
     Attributes:
@@ -71,6 +71,7 @@ class DINOv2BackBone(nn.Module):
             self.num_channels = 1408
         else:
             raise NotImplementedError(f"DINOv2 backbone {backone_name} not implemented")
+        # 稳定提特征，而不是在这里做强数据增强; 不用 make_classification_train_transform()
         self.dino_transform = transforms.Compose(
             [
                 transforms.Resize((224, 224)),
@@ -90,6 +91,9 @@ class DINOv2BackBone(nn.Module):
 
         Returns:
             torch.Tensor: Patch token features [B*views, N_tokens, C].
+            
+            x_norm_clstoken: 全局摘要 token
+            patch-level feature extractor 因此不需要返回全局摘要 token，后续如果需要可以再加上
         """
         xs = self.body.forward_features(tensor)["x_norm_patchtokens"]
 
@@ -108,7 +112,13 @@ class DINOv2BackBone(nn.Module):
         # img_list: is a list of [PIL], each representing multi views of the same example.
         # refer to https://github.com/facebookresearch/dinov2/blob/main/dinov2/data/transforms.py
 
-        # use thread pool to parallel process each view
+        # [
+        #     [view1_img, view2_img, view3_img],   # sample 1
+        #     [view1_img, view2_img, view3_img],   # sample 2
+        #     ...
+        # ]
+        # use thread pool to parallel process each view 创建线程池，用于并行对图片做 transform。
+        # stack the processed views back into a tensor of shape [B, num_view, C, H, W]
         with ThreadPoolExecutor() as executor:
             image_tensors = torch.stack(
                 [
@@ -120,7 +130,7 @@ class DINOv2BackBone(nn.Module):
         # move the tensor to the device of DINO encoder
         B, num_view, C, H, W = image_tensors.shape
         image_tensors = image_tensors.view(B * num_view, C, H, W)
-        device = next(self.parameters()).device
+        device = next(self.parameters()).device #这样不用手写设备，能自动适配模型当前在哪。
         image_tensors = image_tensors.to(device)
 
         return image_tensors

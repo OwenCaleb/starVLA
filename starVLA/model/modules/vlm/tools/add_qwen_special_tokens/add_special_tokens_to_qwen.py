@@ -212,3 +212,5 @@ def start_debugpy_once():
 if __name__ == "__main__":
     start_debugpy_once()
     main()
+
+# 动作用 normal 初始化，其他用 avg 初始化
