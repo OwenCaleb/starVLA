@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：VLA 轨迹数据入口，负责把 data_mix 展开为多个 LeRobot 子数据集并组装混合采样。
+# 上游输入：data_root_dir、data_mix、robot_type 及其对应 data_config。
+# 下游输出：LeRobotMixtureDataset（样本含 image/lang/action/state），供 VLA 分支训练。
+# ====================================================
+
 # Copyright 2025 NVIDIA Corp. and affiliates. All rights reserved.
 # Modified by [Fangjing Wang/ SUST University] in [2025]. 
 # Modification: [return raw data and suport multi-dataset mixture].

@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：VLM 数据源注册表，维护 dataset_use 名称到 annotation/data_path 的映射与采样比例。
+# 上游输入：配置中的 vlm_data.dataset_use（可带百分比采样后缀）。
+# 下游输出：标准化数据源列表，供 LazySupervisedDataset 逐源加载样本。
+# ====================================================
+
 import re
 
 from pathlib import Path

@@ -31,19 +31,25 @@ from starVLA.model.modules.action_model.VLA_AdapterHeader import get_action_mode
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.model.modules.vlm.QWen3 import IMAGE_TOKEN_INDEX, VIDEO_TOKEN_INDEX
+# [Batch_Size, Seq_Len] 151652 = <|vision_start|> 151655 = <|image_pad|> × N 151653 = <|vision_end|> ！！！而是有两段或多段视觉块，这个时候中间的<|vision_start|><|vision_end|>会被误算在内！！！
+def get_image_token_positions(batch_inputs):
+    IMAGE_TOKEN_ID = IMAGE_TOKEN_INDEX
+    input_ids = batch_inputs["input_ids"]
+    image_mask = (input_ids == IMAGE_TOKEN_ID)
 
-def get_image_token_counts(batch_inputs):
-    IMAGE_TOKEN_ID = IMAGE_TOKEN_INDEX 
-    
-    # input_ids shape: [Batch_Size, Seq_Len]
-    # result shape: [Batch_Size]
-    num_tokens_per_sample = torch.sum(batch_inputs['input_ids'] == IMAGE_TOKEN_ID, dim=1)
-    # also get the last index of the image token for each sample if needed
-    last_index_per_sample = (batch_inputs['input_ids'] == IMAGE_TOKEN_ID).int().cumsum(dim=1).argmax(dim=1)
-    # also get the first index of the image token for each sample if needed
-    first_index_per_sample = (batch_inputs['input_ids'] == IMAGE_TOKEN_ID).int().cumsum(dim=1).argmin(dim=1)
-    
-    return num_tokens_per_sample, first_index_per_sample, last_index_per_sample
+    # Count real image pad tokens per sample.
+    num_tokens_per_sample = image_mask.sum(dim=1).long()
+    batch_size = input_ids.shape[0]
+    max_patch_len = int(num_tokens_per_sample.max().item())
+
+    # Build padded index table: each row stores exact image token positions for one sample.
+    image_positions_tensor = torch.zeros((batch_size, max_patch_len), dtype=torch.long, device=input_ids.device)
+    for b in range(batch_size):
+        pos = torch.where(image_mask[b])[0]
+        if pos.numel() > 0:
+            image_positions_tensor[b, :pos.numel()] = pos
+
+    return num_tokens_per_sample, image_positions_tensor, max_patch_len
 
 
 class ProprioProjector(nn.Module):
@@ -200,13 +206,7 @@ class Qwen_Adapter(baseframework):
         # Extract features (FULLY VECTORIZED)
         # ============================================================
         multi_layer_hidden_states = []
-        num_images, first_index_per_sample, last_index_per_sample = get_image_token_counts(qwen_inputs)
-        
-        max_patch_len = -999
-        for b in range(batch_size):
-            sample_patch_len = last_index_per_sample[b] - first_index_per_sample[b] + 1
-            if sample_patch_len > max_patch_len:
-                max_patch_len = sample_patch_len.item()
+        vision_patch_lengths, image_positions_tensor, max_patch_len = get_image_token_positions(qwen_inputs)
         
         for layer_hidden in hidden_states[0:]:
             # layer_hidden: [B, L, H]
@@ -216,19 +216,12 @@ class Qwen_Adapter(baseframework):
             # ============================================================
             # Create batch of indices [B, max_patch_len]
             batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, max_patch_len)  # [B, max_patch_len]
-            seq_indices = torch.arange(max_patch_len, device=device).unsqueeze(0).expand(batch_size, -1)  # [B, max_patch_len]
-
-            # Add first_index_per_sample offset to get actual positions
-            seq_indices = seq_indices + first_index_per_sample.unsqueeze(1)  # [B, max_patch_len]
-
-            # Clamp to valid range (shouldn't exceed last_index_per_sample)
-            seq_indices = torch.clamp(seq_indices, max=last_index_per_sample.unsqueeze(1))  # [B, max_patch_len]
+            seq_indices = image_positions_tensor  # [B, max_patch_len], exact image token positions only
 
             # Advanced indexing to extract vision features
             batch_vision_states = layer_hidden[batch_indices, seq_indices, :]  # [B, max_patch_len, H]
 
-            # Mask padding - now based on actual vision patch lengths per sample
-            vision_patch_lengths = last_index_per_sample - first_index_per_sample + 1  # [B]
+            # Mask padding based on true image token count per sample.
             padding_mask = torch.arange(max_patch_len, device=device).unsqueeze(0) >= vision_patch_lengths.unsqueeze(1)  # [B, max_patch_len]
             batch_vision_states = batch_vision_states.masked_fill(padding_mask.unsqueeze(-1), 0.0)
             
@@ -275,6 +268,25 @@ class Qwen_Adapter(baseframework):
             device=predicted_actions.device, 
             dtype=predicted_actions.dtype
         )
+
+        # Keep supervision length consistent with model output length.
+        if gt_actions.shape[-1] != predicted_actions.shape[-1]:
+            raise ValueError(
+                f"Action dim mismatch: gt={gt_actions.shape[-1]}, pred={predicted_actions.shape[-1]}. "
+                "Please check framework.action_model.action_dim and dataset action dimension."
+            )
+
+        if gt_actions.shape[1] != predicted_actions.shape[1]:
+            target_len = min(gt_actions.shape[1], predicted_actions.shape[1])
+            logger.warning(
+                "Action chunk length mismatch detected (gt=%d, pred=%d). "
+                "Truncating both to %d for L1 loss.",
+                gt_actions.shape[1],
+                predicted_actions.shape[1],
+                target_len,
+            )
+            gt_actions = gt_actions[:, :target_len, :]
+            predicted_actions = predicted_actions[:, :target_len, :]
 
         loss = torch.nn.L1Loss()(predicted_actions, gt_actions)
 
@@ -376,13 +388,7 @@ class Qwen_Adapter(baseframework):
         # Extract features (FULLY VECTORIZED)
         # ============================================================
         multi_layer_hidden_states = []
-        num_images, first_index_per_sample, last_index_per_sample = get_image_token_counts(qwen_inputs)
-        
-        max_patch_len = -999
-        for b in range(batch_size):
-            sample_patch_len = last_index_per_sample[b] - first_index_per_sample[b] + 1
-            if sample_patch_len > max_patch_len:
-                max_patch_len = sample_patch_len.item()
+        vision_patch_lengths, image_positions_tensor, max_patch_len = get_image_token_positions(qwen_inputs)
         
         for layer_hidden in hidden_states[0:]:
             # layer_hidden: [B, L, H]
@@ -392,19 +398,12 @@ class Qwen_Adapter(baseframework):
             # ============================================================
             # Create batch of indices [B, max_patch_len]
             batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, max_patch_len)  # [B, max_patch_len]
-            seq_indices = torch.arange(max_patch_len, device=device).unsqueeze(0).expand(batch_size, -1)  # [B, max_patch_len]
-
-            # Add first_index_per_sample offset to get actual positions
-            seq_indices = seq_indices + first_index_per_sample.unsqueeze(1)  # [B, max_patch_len]
-
-            # Clamp to valid range (shouldn't exceed last_index_per_sample)
-            seq_indices = torch.clamp(seq_indices, max=last_index_per_sample.unsqueeze(1))  # [B, max_patch_len]
+            seq_indices = image_positions_tensor  # [B, max_patch_len], exact image token positions only
 
             # Advanced indexing to extract vision features
             batch_vision_states = layer_hidden[batch_indices, seq_indices, :]  # [B, max_patch_len, H]
 
-            # Mask padding - now based on actual vision patch lengths per sample
-            vision_patch_lengths = last_index_per_sample - first_index_per_sample + 1  # [B]
+            # Mask padding based on true image token count per sample.
             padding_mask = torch.arange(max_patch_len, device=device).unsqueeze(0) >= vision_patch_lengths.unsqueeze(1)  # [B, max_patch_len]
             batch_vision_states = batch_vision_states.masked_fill(padding_mask.unsqueeze(-1), 0.0)
             
@@ -480,9 +479,11 @@ if __name__ == "__main__":
 
     # fake sample 
     image = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+    debug_chunk_len = cfg.framework.action_model.num_actions_chunk
+    debug_action_dim = cfg.framework.action_model.action_dim
     # Create a sample
     sample = {
-        "action": np.random.uniform(-1, 1, size=(16, 14)).astype(np.float16), # action_chunk, action_dim
+        "action": np.random.uniform(-1, 1, size=(debug_chunk_len, debug_action_dim)).astype(np.float16), # action_chunk, action_dim
         "image": [image, image], # two views
         "lang": "This is a fake for testing.",
         # "state" : np.random.uniform(-1, 1, size=(1, 14)).astype(np.float16), # chunk, state_dim

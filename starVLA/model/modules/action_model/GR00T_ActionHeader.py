@@ -93,7 +93,7 @@ class ActionEncoder(nn.Module):
         # 2) Standard action MLP step for shape => (B, T, w)
         a_emb = self.layer1(actions)
 
-        # 3) Get the sinusoidal encoding (B, T, w)
+        # 3) Get the sinusoidal encoding (B, T, w)  sin/cos → tau_emb 把一个“标量时间 t”，变成一个“高维向量表示”。
         tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)
 
         # 4) Concat along last dim => (B, T, 2w), then layer2 => (B, T, w), swish
@@ -230,7 +230,7 @@ class FlowmatchingActionHead(nn.Module):
         diffusion_model_cfg = {**action_model_cfg, **diffusion_model_cfg}
         self.model = DiT(**diffusion_model_cfg)
         self.action_dim = config.action_dim
-        self.action_horizon = config.future_action_window_size + 1
+        self.action_horizon = config.future_action_window_size + 1 # include current time
         self.num_inference_timesteps = config.num_inference_timesteps
 
         self.state_encoder = MLP(
@@ -251,12 +251,12 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
-        if config.add_pos_embed:
+        if config.add_pos_embed: # 第几个 动作 区分 去噪时间
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
-        self.num_timestep_buckets = config.num_timestep_buckets
+        self.num_timestep_buckets = config.num_timestep_buckets # 离散化时间步的桶数，决定了时间编码的分辨率 0.13->130
         self.config = config
 
     def sample_time(self, batch_size, device, dtype):

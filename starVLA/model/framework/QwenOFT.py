@@ -82,7 +82,7 @@ class Qwenvl_OFT(baseframework):
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         # self.hidden_dim = config.framework.action_model.action_hidden_dim
         
-        self.action_token = "🔍" # TODO also can add spacail token to Qwen, but too complex
+        self.action_token = "🔍" # TODO also can add spacial token to Qwen, but too complex
         self.action_token_id = self.qwen_vl_interface.processor.tokenizer("🔍", add_special_tokens=False)["input_ids"][0]
 
         # L1 损失
@@ -274,7 +274,7 @@ if __name__ == "__main__":
     cfg = OmegaConf.load(args.config_yaml)
     cfg.framework.action_model.action_hidden_dim = 2048
 
-    cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Florence-2-large"
+    # cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Florence-2-large"
     
 
     # try get model

@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：定义变换基类与组合器（ComposedModalityTransform），规范变换调用协议。
+# 上游输入：单个样本的多模态字段字典。
+# 下游输出：按顺序处理后的样本字典，作为后续训练样本打包输入。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

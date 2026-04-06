@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：dataloader 总入口与分发器，按 dataset_py 选择 VLA 或 VLM 数据管线。
+# 上游输入：训练配置 cfg.datasets.*（如 dataset_py、batch_size、data_mix）。
+# 下游输出：可直接迭代的 DataLoader，供训练循环按 step 取 batch。
+# ====================================================  
+
 import json
 import os
 from accelerate.logging import get_logger
@@ -48,8 +54,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             num_workers=4,
             # shuffle=True
         )        
-        if dist.get_rank() == 0: 
-            
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
         return vla_train_dataloader

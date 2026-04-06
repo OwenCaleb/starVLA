@@ -38,15 +38,36 @@ from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, normalize_dotlist_args
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Initialize logger
 logger = get_logger(__name__)
+
+
+def build_accelerator(cfg):
+    """Create an Accelerator that matches the current run mode.
+
+    Debug or single-process runs should not require DeepSpeed/MPI.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if getattr(cfg, "is_debug", False) or world_size == 1:
+        accelerator = Accelerator()
+    else:
+        deepspeed_plugin = DeepSpeedPlugin()
+        accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+
+    accelerator.print(accelerator.state)
+    return accelerator
+
+
+def _is_rank0() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _maybe_barrier() -> None:
+    if dist.is_initialized():
+        dist.barrier()
 
 
 def load_fast_tokenizer():
@@ -71,7 +92,7 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
-    dist.barrier()
+    _maybe_barrier()
     return vla_train_dataloader
 
 
@@ -235,7 +256,7 @@ class VLATrainer(TrainerUtils):
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
+        if self.completed_steps % self.config.trainer.logging_frequency == 0 and _is_rank0():
             metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
             metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
             wandb.log(metrics, step=self.completed_steps)
@@ -317,7 +338,7 @@ class VLATrainer(TrainerUtils):
             step_metrics["mse_score"] = score / num_pots
 
         del examples
-        dist.barrier()
+        _maybe_barrier()
         return step_metrics
 
     def _log_training_config(self):
@@ -386,11 +407,11 @@ class VLATrainer(TrainerUtils):
 
 
 def main(cfg) -> None:
+    cfg = wrap_config(cfg) # 保存下来，并且让后续访问都能被记录（如果是AccessTrackedConfig的话）
+
+    accelerator = build_accelerator(cfg)
     logger.info("VLA Training :: Warming Up")
-
-    cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
-
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
@@ -409,8 +430,9 @@ def main(cfg) -> None:
     trainer.train()
 
     logger.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -418,7 +440,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config_yaml",
         type=str,
-        default="starVLA/config/training/starvla_cotrain_oxe.yaml",
+        default="starVLA/config/training/starvla_cotrain_libero.yaml",
         help="Path to YAML config",
     )
     args, clipargs = parser.parse_known_args()
@@ -428,7 +450,7 @@ if __name__ == "__main__":
     cli_cfg = OmegaConf.from_dotlist(dotlist)
     cfg = OmegaConf.merge(cfg, cli_cfg)
 
-    if cfg.is_debug and dist.is_initialized() and dist.get_rank() == 0:
+    if cfg.is_debug and _is_rank0():
         import debugpy
 
         debugpy.listen(("0.0.0.0", 10092))

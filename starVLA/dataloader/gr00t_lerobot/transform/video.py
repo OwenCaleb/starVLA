@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：视频/图像模态变换集合（裁剪、缩放、颜色抖动、格式转换）。
+# 上游输入：从轨迹中读取的原始帧序列。
+# 下游输出：模型可用的视觉张量或 numpy 表示，与其他模态在时间维对齐。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

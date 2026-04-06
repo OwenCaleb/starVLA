@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：状态与动作的核心预处理（to tensor、归一化、旋转表示转换、阈值二值化）。
+# 上游输入：原始 state/action 数值序列及 metadata 统计量。
+# 下游输出：尺度一致、表示一致的 state/action 张量，提升跨数据集可训练性。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

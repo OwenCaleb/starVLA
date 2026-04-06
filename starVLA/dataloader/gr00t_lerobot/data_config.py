@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：定义各 robot_type 的模态字段映射与预处理策略（delta_indices、归一化、旋转表示等）。
+# 上游输入：mixture 中的 robot_type 与原始数据字段命名。
+# 下游输出：modality_config + transforms，驱动 LeRobotSingleDataset 的取数与变换行为。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

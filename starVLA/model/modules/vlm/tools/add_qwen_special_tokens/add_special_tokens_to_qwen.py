@@ -49,9 +49,13 @@ def add_new_tokens(
         else:
             added_now = tokenizer.add_tokens(to_add_tokens)
 
+    # ================== minimal-fix: init both real token ids and tail extra rows ==================
+    new_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in to_add_tokens]
+
     # 4) Target total size (base + newly added)
     # target_size = len(tokenizer) # total vocab --> whether to keep previously reserved empty tokens?
     target_size = old_embed_size + added_now
+    init_indices = sorted(set(new_token_ids) | set(range(old_embed_size, target_size)))
     # 5) If tokenizer total size exceeds model embedding size, resize and init new rows
     action_token_start_idx = old_embed_size  # no-reserve plan here
     action_token_end_idx = old_embed_size - 1  # default: "no additions"
@@ -61,13 +65,13 @@ def add_new_tokens(
         with torch.no_grad():
             if init_strategy == "avg":
                 ref_vec = old_embed.weight.mean(dim=0, keepdim=True)
-                for idx in range(old_embed_size, target_size):
+                for idx in init_indices:
                     new_embed.weight[idx].copy_(ref_vec[0])
             elif init_strategy == "zero":
-                for idx in range(old_embed_size, target_size):
+                for idx in init_indices:
                     new_embed.weight[idx].zero_()
             elif init_strategy == "normal":
-                for idx in range(old_embed_size, target_size):
+                for idx in init_indices:
                     nn.init.normal_(new_embed.weight[idx], mean=0.0, std=0.02)
             else:
                 raise ValueError(f"Unknown init_strategy: {init_strategy}")
@@ -152,19 +156,19 @@ def main():
     print(f"[INFO] Loading model: {args.model_id}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     tokenizer.padding_side = args.padding_side
-    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    #     args.model_id,
-    #     torch_dtype="auto",
-    #     device_map="auto" if args.device == "auto" else None,
-    #     trust_remote_code=True,
-    # )
-
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_id,
-        attn_implementation="flash_attention_2",
-        dtype=torch.bfloat16,
-        device_map="cuda",
+        torch_dtype="auto",
+        device_map="auto" if args.device == "auto" else None,
+        trust_remote_code=True,
     )
+
+    # model = Qwen3VLForConditionalGeneration.from_pretrained(
+    #     args.model_id,
+    #     attn_implementation="flash_attention_2",
+    #     dtype=torch.bfloat16,
+    #     device_map="cuda",
+    # )
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
     processor.tokenizer.padding_side = "left"
 
@@ -192,6 +196,7 @@ def main():
     # Re-validate
     reload_and_check(args.save_dir, tokens)
 
+    print(f"embedding 侧已经存在、但 tokenizer 侧还没占用的 id 槽位,因此对不上，但是经过个人修改后全部能够初始化；具体还是需要参考tokenizer_config.json")
     print(f"[INFO] Newly added to tokenizer: {added}")
     # print(f"[INFO] Token mapping: {mapping}")
     print(f"[INFO] Action token idx range: [{action_token_start_idx}, {action_token_end_idx}]")
@@ -210,7 +215,7 @@ def start_debugpy_once():
     start_debugpy_once._started = True
 
 if __name__ == "__main__":
-    start_debugpy_once()
+    # start_debugpy_once()
     main()
 
 # 动作用 normal 初始化，其他用 avg 初始化

@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：定义 LeRobot 元数据/统计信息的结构化 schema（校验与序列化边界）。
+# 上游输入：meta/modality.json、stats 等原始元数据。
+# 下游输出：强类型 metadata/statistics 对象，供 dataset 读取与变换模块安全使用。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

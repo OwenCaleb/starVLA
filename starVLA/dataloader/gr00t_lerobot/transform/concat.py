@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：执行状态/动作等多键拼接，把分散模态字段整理为连续向量表示。
+# 上游输入：按键拆分的 state/action/video 模态张量。
+# 下游输出：拼接后的统一特征键，便于模型侧按固定维度消费。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：构建 Qwen 多模态 RoPE 位置索引，处理文本与图像/视频 patch 的位置对齐。
+# 上游输入：token 序列、image/video grid_thw、attention_mask。
+# 下游输出：position_ids 与 mrope_position_deltas，供 VLM 前向计算注意力位置编码。
+# ====================================================
+
 import os
 import copy
 import json

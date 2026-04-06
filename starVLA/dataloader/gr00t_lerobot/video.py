@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：底层视频读取工具，按索引或时间戳抽帧，服务于 LeRobot 数据解码。
+# 上游输入：视频路径、目标帧索引/时间戳、后端参数。
+# 下游输出：指定时刻的帧数据，供 dataset 组装为视觉模态字段。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

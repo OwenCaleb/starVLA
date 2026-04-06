@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：维护 robot_type 与 embodiment_tag 的映射，用于跨机器人数据对齐与统计聚合分组。
+# 上游输入：lerobot_datasets.py 传入的 robot_type。
+# 下游输出：标准化 tag，供 dataset 初始化与 metadata merge 使用。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

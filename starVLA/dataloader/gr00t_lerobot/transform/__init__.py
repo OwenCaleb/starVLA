@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：transform 子模块入口，组织并导出各类模态变换组件。
+# 上游输入：data_config 选择的变换链定义。
+# 下游输出：可复用的 transform 组合能力，供 dataset 在取样后统一调用。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

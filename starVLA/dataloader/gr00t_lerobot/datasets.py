@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：LeRobot 数据核心引擎（单数据集读取 + 多数据集混采 + 样本打包 + 统计融合）。
+# 上游输入：dataset_path、modality_configs、transforms、采样权重与元数据文件(meta/*)。
+# 下游输出：统一训练样本 dict（image/lang/action/state）及可保存的 merged 统计信息。
+# ====================================================
+
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #

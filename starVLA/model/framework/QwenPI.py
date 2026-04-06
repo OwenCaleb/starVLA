@@ -211,7 +211,7 @@ if __name__ == "__main__":
 
     cfg = OmegaConf.load(args.config_yaml)
     # try get model
-    cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Qwen3-VL-4B-Instruct"
+    cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Qwen2.5-VL-3B-Instruct"
     
 
     model = Qwen_PI(cfg)

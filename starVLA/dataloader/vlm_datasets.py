@@ -1,3 +1,9 @@
+# ================== 数据流文件说明 ==================
+# 文件作用：VLM 多模态 SFT 数据主链路，负责样本懒加载、Qwen 格式化、RoPE 位置构建与 batch collate。
+# 上游输入：dataset_use/eval_dataset、image_processor、tokenizer 与多模态标注(json/jsonl)。
+# 下游输出：训练所需 tensor batch（input_ids/labels/pixel_values/position_ids 等）。
+# ====================================================
+
 import os
 import copy
 import json

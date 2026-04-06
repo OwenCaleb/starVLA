@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from PIL import Image
+from PIL.Image import Image as PILImage
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
@@ -53,6 +54,26 @@ class NeuroVLA(baseframework):
 
         self.L1_loss = nn.L1Loss()
         self.norm_stats = norm_stats
+
+    def _roll_states_with_predictions(self, states: torch.Tensor, predicted_actions: torch.Tensor) -> torch.Tensor:
+        """Roll state history forward and append newly predicted actions at the tail."""
+        window = states.shape[1]
+        step = predicted_actions.shape[1]
+        new_states = torch.zeros_like(states)
+
+        # Keep gripper state stable for newly appended slots.
+        tail_gripper = states[:, -1:, 7:8]
+
+        if step >= window:
+            new_states[:, :, :7] = predicted_actions[:, -window:, :]
+            new_states[:, :, 7:8] = tail_gripper.expand(-1, window, -1)
+            return new_states
+
+        # Shift old history left by `step` and append new predictions to the end.
+        new_states[:, :-step, :] = states[:, step:, :]
+        new_states[:, -step:, :7] = predicted_actions
+        new_states[:, -step:, 7:8] = tail_gripper.expand(-1, step, -1)
+        return new_states
 
 
 
@@ -129,11 +150,8 @@ class NeuroVLA(baseframework):
                 predicted_actions = self.action_model.predict_action(edit_action_feature)
                 all_predicted_actions.append(predicted_actions)
 
-                # Update states for next iteration
-                predicted_states = torch.zeros_like(states)
-                predicted_states[:, :predicted_actions.shape[1], :7] = predicted_actions
-                predicted_states[:, :, 7] = states[:, :, 7]  # Keep gripper state
-                states = predicted_states.clone()
+                # Update states with temporal rolling semantics.
+                states = self._roll_states_with_predictions(states, predicted_actions)
                 inference_num += 1
 
             # Compute action loss
@@ -146,7 +164,7 @@ class NeuroVLA(baseframework):
 
     def predict_action(
         self,
-        batch_images: Union[Image, List[Image]],
+        batch_images: Union[PILImage, List[PILImage]],
         instructions: List[str],
         states: Optional[List[Sequence[float]]] = None,
         solutions: Union[Dict, List[Dict]] = None,
@@ -224,11 +242,8 @@ class NeuroVLA(baseframework):
                 samples = self.action_model.predict_action(edit_action_feature)
                 all_predicted_actions.append(samples)
 
-                # Update states for next iteration
-                predicted_states = torch.zeros_like(states)
-                predicted_states[:, :samples.shape[1], :7] = samples
-                predicted_states[:, :, 7] = states[:, :, 7]  # Keep gripper state
-                states = predicted_states.clone()
+                # Update states with temporal rolling semantics.
+                states = self._roll_states_with_predictions(states, samples)
                 predict_num += 1
 
         # Concatenate all predicted action chunks
@@ -260,10 +275,11 @@ if __name__ == "__main__":
 
     # Option 1: Load from pretrained checkpoint
     # model = NeuroVLA.from_pretrained("path/to/checkpoint.pt").to(device)
-    model = NeuroVLA.from_pretrained("/workspace/nature_submit/NeuroVLA/playground/Checkpoints/1104_neurovla_gru_xiaonao_goal_dualimage_spike_multistep_ac8_768*2_yibu/checkpoints/steps_10000_pytorch_model.pt").to(device)
+    # model = NeuroVLA.from_pretrained("/workspace/nature_submit/NeuroVLA/playground/Checkpoints/1104_neurovla_gru_xiaonao_goal_dualimage_spike_multistep_ac8_768*2_yibu/checkpoints/steps_10000_pytorch_model.pt").to(device)
     # Option 2: Build from config
-    # config = OmegaConf.load("path/to/config.yaml")
-    # model = NeuroVLA(config).to(device)
+    # Default: build a clean model from NeuroVLA config.
+    config = OmegaConf.load("/mnt/nas_ssd/workspace/wenboli/projects/starVLA/starVLA/config/training/neurovla_debug.yaml")
+    model = NeuroVLA(config).to(device)
 
     # Prepare sample data
     # Each sample should contain:
@@ -273,18 +289,24 @@ if __name__ == "__main__":
     # - "action": Ground truth actions [T, 7] (for training only)
 
     # Example data structure:
-    # samples = [
-    #     {
-    #         "image": [],  # List of PIL Images
-    #         "lang": "pick up the red block",
-    #         "state": np.zeros((16, 8)),  # [T, 8] state history
-    #         "action": np.zeros((8, 7)),  # [T, 7] action sequence
-    #     }
-    # ]
+    from PIL import Image
+    import numpy as np
+
+    samples = [
+        {
+            "image": [
+                Image.new("RGB", (224, 224), color=(255, 0, 0)),
+                Image.new("RGB", (224, 224), color=(0, 255, 0)),
+            ],  # List of PIL Images
+            "lang": "pick up the red block",
+            "state": np.zeros((16, 8), dtype=np.float32),  # [T, 8] state history
+            "action": np.zeros((8, 7), dtype=np.float32),  # [T, 7] action sequence
+        }
+    ]
     import pickle
     from omegaconf import OmegaConf
-    with open("/workspace/samples_states.pkl", "rb") as f:
-        samples = pickle.load(f)
+    # with open("/workspace/samples_states.pkl", "rb") as f:
+    #     samples = pickle.load(f)
     device = torch.device("cuda:0")
 
     # Extract data for inference

@@ -313,7 +313,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 hidden_states=model_output,
                 encoder_hidden_states=vl_embs_list[layer_idx],  # Use layer-specific vl_embs
                 temb=temb,
-            )
+            ) # Self attention will be cross attention
         
         # TODO miss self att and _process_output, but work well
         pred = self.action_decoder(model_output)
