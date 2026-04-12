@@ -1,0 +1,22 @@
+{
+  "chat.useCustomizationsInParentRepositories": true,
+  "chat.promptFilesLocations": {
+    ".github/prompts": true
+  },
+  "github.copilot.chat.organizationInstructions.enabled": true,
+
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/*.egg-info": true
+  },
+  "search.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/*.egg-info": true,
+    "results/": true,
+    "playground/": true
+  }
+}

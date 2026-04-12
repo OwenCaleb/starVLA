@@ -1,23 +1,14 @@
-export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=29500
 
-export NCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
-export NCCL_IB_DISABLE=1
-unset NCCL_IB_HCA
 
-export TORCH_NCCL_BLOCKING_WAIT=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_TIMEOUT=10000
+# export NCCL_SOCKET_IFNAME=bond0
+export NCCL_SOCKET_IFNAME=eno1
+# export NCCL_IB_HCA=mlx5_2,mlx5_3
+
+# used for check save when communication
+export NCCL_BLOCKING_WAIT=1
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
-export NCCL_DEBUG=INFO
-###########################################################################################
-# === Please modify the following paths according to your environment ===
-config_yaml=./starVLA/config/training/myvla_stage1.yaml
-run_root_dir=./results/Checkpoints
-run_id=0408_libero4in1_myvla_stage1
-
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
 Framework_name=QwenOFT

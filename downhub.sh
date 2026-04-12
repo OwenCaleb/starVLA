@@ -38,8 +38,11 @@ HF_HUB_CACHE="${HF_HUB_CACHE:-}"
 MAX_RETRIES="${MAX_RETRIES:-10}"
 SLEEP_SECS="${SLEEP_SECS:-20}"
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-8}"
+STALL_TIMEOUT="${STALL_TIMEOUT:-900}"      # seconds with no log growth before considering stalled; 0 disables
+WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-15}"  # watchdog check interval (seconds)
 ASSUME_YES="${ASSUME_YES:-0}"  # 1 means auto-confirm in non-interactive runs
 BACKGROUND_DOWNLOAD="${BACKGROUND_DOWNLOAD:-0}"  # 1 means spawn a background worker
+AUTO_RELINK_NON_SYMLINK="${AUTO_RELINK_NON_SYMLINK:-1}"  # 1 means backup existing non-symlink path then create symlink
 
 # You can add your own mirror / proxy / internal gateway probes here.
 # These are only connectivity probes, not direct download commands.
@@ -49,6 +52,9 @@ PROBE_URLS_DEFAULT=(
   "https://modelscope.cn"
   "https://www.modelscope.cn"
 )
+
+INTERRUPTED=0
+ACTIVE_CHILD_PID=""
 
 # =========================
 # Helpers
@@ -96,6 +102,20 @@ print_kv() {
   printf "\033[1m%-12s\033[0m = %s\n" "$key" "$val"
 }
 
+on_interrupt() {
+  INTERRUPTED=1
+  warn "Interrupt received, stopping and exiting..."
+
+  if [[ -n "$ACTIVE_CHILD_PID" ]]; then
+    kill "$ACTIVE_CHILD_PID" >/dev/null 2>&1 || true
+  fi
+
+  pkill -P $$ >/dev/null 2>&1 || true
+  exit 130
+}
+
+trap 'on_interrupt' INT TERM
+
 launch_background_download() {
   local ts log_file
   ts="$(date +%Y%m%d_%H%M%S)"
@@ -105,6 +125,7 @@ launch_background_download() {
   nohup env \
     ASSUME_YES=1 \
     BACKGROUND_DOWNLOAD=0 \
+    AUTO_RELINK_NON_SYMLINK="$AUTO_RELINK_NON_SYMLINK" \
     SOURCE="$SOURCE" \
     RESOURCE="$RESOURCE" \
     REPO_ID="$REPO_ID" \
@@ -189,6 +210,16 @@ default_link_base_for_resource() {
 validate_positive_int() {
   local v="$1"
   [[ "$v" =~ ^[0-9]+$ ]] && [[ "$v" -gt 0 ]]
+}
+
+validate_non_negative_int() {
+  local v="$1"
+  [[ "$v" =~ ^[0-9]+$ ]]
+}
+
+validate_bool01() {
+  local v="$1"
+  [[ "$v" == "0" || "$v" == "1" ]]
 }
 
 derive_hf_cache_root_from_real_base() {
@@ -528,9 +559,26 @@ safe_ln_sfn() {
   ensure_parent_dir "$dst"
 
   if [[ -e "$dst" && ! -L "$dst" ]]; then
-    color red "ERROR: $dst exists and is NOT a symlink."
-    color yellow "Please move/remove it manually, or choose another LINK_BASE."
-    return 1
+    local src_real dst_real
+    src_real="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+    dst_real="$(readlink -f "$dst" 2>/dev/null || echo "$dst")"
+
+    if [[ "$src_real" == "$dst_real" ]]; then
+      info "Destination already points to source path effectively; skip relink."
+      return 0
+    fi
+
+    if [[ "$AUTO_RELINK_NON_SYMLINK" == "1" ]]; then
+      local ts backup_dst
+      ts="$(date +%Y%m%d_%H%M%S)"
+      backup_dst="${dst}.backup_${ts}"
+      warn "$dst exists and is NOT a symlink; moving to backup: $backup_dst"
+      mv "$dst" "$backup_dst"
+    else
+      color red "ERROR: $dst exists and is NOT a symlink."
+      color yellow "Please move/remove it manually, set AUTO_RELINK_NON_SYMLINK=1, or choose another LINK_BASE."
+      return 1
+    fi
   fi
 
   ln -sfn "$src" "$dst"
@@ -548,9 +596,106 @@ show_summary() {
   print_kv "HF_HUB_CACHE" "$HF_HUB_CACHE"
   print_kv "MAX_RETRIES" "$MAX_RETRIES"
   print_kv "SLEEP_SECS" "$SLEEP_SECS"
+  print_kv "STALL_SECS" "$STALL_TIMEOUT"
+  print_kv "WDOG_SECS" "$WATCHDOG_INTERVAL"
+  print_kv "AUTO_RELINK" "$AUTO_RELINK_NON_SYMLINK"
   print_kv "BG_DOWNLOAD" "$BACKGROUND_DOWNLOAD"
   print_kv "REAL_DIR" "$REAL_DIR"
   print_kv "LINK_DIR" "$LINK_DIR"
+}
+
+wait_with_watchdog() {
+  local child_pid="$1"
+  local log_file="$2"
+  local tag="$3"
+
+  local now
+  now="$(date +%s)"
+  local last_change_ts="$now"
+  local last_size="-1"
+
+  while kill -0 "$child_pid" >/dev/null 2>&1; do
+    if [[ "$INTERRUPTED" -eq 1 ]]; then
+      kill "$child_pid" >/dev/null 2>&1 || true
+      wait "$child_pid" >/dev/null 2>&1 || true
+      return 130
+    fi
+
+    local current_size=0
+    if [[ -f "$log_file" ]]; then
+      current_size="$(wc -c < "$log_file" 2>/dev/null || echo 0)"
+    fi
+
+    now="$(date +%s)"
+    if [[ "$current_size" != "$last_size" ]]; then
+      last_size="$current_size"
+      last_change_ts="$now"
+    elif [[ "$STALL_TIMEOUT" -gt 0 ]] && (( now - last_change_ts >= STALL_TIMEOUT )); then
+      warn "[$tag] No output progress for ${STALL_TIMEOUT}s, treating as stalled."
+      kill "$child_pid" >/dev/null 2>&1 || true
+      sleep 2
+      kill -9 "$child_pid" >/dev/null 2>&1 || true
+      wait "$child_pid" >/dev/null 2>&1 || true
+      return 124
+    fi
+
+    sleep "$WATCHDOG_INTERVAL"
+  done
+
+  wait "$child_pid"
+  return $?
+}
+
+hf_incomplete_total_bytes() {
+  local real_dir="$1"
+  local cache_dir="$real_dir/.cache/huggingface/download"
+
+  if [[ ! -d "$cache_dir" ]]; then
+    echo 0
+    return 0
+  fi
+
+  find "$cache_dir" -type f -name "*.incomplete" -printf '%s\n' 2>/dev/null | \
+    awk '{s+=$1} END{print s+0}'
+}
+
+wait_with_hf_cache_watchdog() {
+  local child_pid="$1"
+  local real_dir="$2"
+
+  local now
+  now="$(date +%s)"
+  local last_change_ts="$now"
+  local last_bytes="-1"
+
+  while kill -0 "$child_pid" >/dev/null 2>&1; do
+    if [[ "$INTERRUPTED" -eq 1 ]]; then
+      kill "$child_pid" >/dev/null 2>&1 || true
+      wait "$child_pid" >/dev/null 2>&1 || true
+      return 130
+    fi
+
+    local current_bytes
+    current_bytes="$(hf_incomplete_total_bytes "$real_dir")"
+    now="$(date +%s)"
+
+    if [[ "$current_bytes" != "$last_bytes" ]]; then
+      last_bytes="$current_bytes"
+      last_change_ts="$now"
+    elif [[ "$STALL_TIMEOUT" -gt 0 ]] && (( now - last_change_ts >= STALL_TIMEOUT )); then
+      warn "[HF] No cache byte progress for ${STALL_TIMEOUT}s, treating as stalled."
+      kill "$child_pid" >/dev/null 2>&1 || true
+      sleep 2
+      kill -9 "$child_pid" >/dev/null 2>&1 || true
+      wait "$child_pid" >/dev/null 2>&1 || true
+      return 124
+    fi
+
+    sleep "$WATCHDOG_INTERVAL"
+  done
+
+  wait "$child_pid"
+  return $?
 }
 
 # =========================
@@ -594,13 +739,40 @@ hf_download_with_retry() {
   local sleep_secs="$SLEEP_SECS"
 
   for i in $(seq 1 "$MAX_RETRIES"); do
+    if [[ "$INTERRUPTED" -eq 1 ]]; then
+      warn "Interrupted by user, aborting retries."
+      return 130
+    fi
+
     local log="/tmp/downhub_hf_attempt_${i}.log"
+    : > "$log"
     color blue "[HF] Attempt $i/$MAX_RETRIES ... log=$log"
 
+    local use_tee=1
+    if [[ "$BACKGROUND_DOWNLOAD" != "1" && -t 1 ]]; then
+      use_tee=0
+      info "[HF] Interactive TTY detected: preserving live progress bar (no tee pipe)."
+    fi
+
     set +e
-    hf_download_once "$tool" "$resource" "$repo_id" "$real_dir" 2>&1 | tee "$log"
-    rc=${PIPESTATUS[0]}
+    if [[ "$use_tee" -eq 1 ]]; then
+      hf_download_once "$tool" "$resource" "$repo_id" "$real_dir" > >(tee "$log") 2>&1 &
+      ACTIVE_CHILD_PID=$!
+      wait_with_watchdog "$ACTIVE_CHILD_PID" "$log" "HF"
+      rc=$?
+    else
+      hf_download_once "$tool" "$resource" "$repo_id" "$real_dir" &
+      ACTIVE_CHILD_PID=$!
+      wait_with_hf_cache_watchdog "$ACTIVE_CHILD_PID" "$real_dir"
+      rc=$?
+    fi
+    ACTIVE_CHILD_PID=""
     set -e
+
+    if [[ $rc -eq 130 || "$INTERRUPTED" -eq 1 ]]; then
+      warn "Download interrupted by user (Ctrl+C)."
+      return 130
+    fi
 
     if [[ $rc -eq 0 ]]; then
       color green "[HF] Download finished."
@@ -610,8 +782,16 @@ hf_download_with_retry() {
     if grep -q "429" "$log"; then
       color yellow "[HF] Hit rate limit / auth-related issue."
       color yellow "Tip: hf auth login  或者 export HF_TOKEN=..."
+    elif [[ $rc -eq 124 ]]; then
+      color yellow "[HF] Detected stall (no log growth)."
+      color yellow "Tip: check network/proxy, then script will retry with resume."
     else
       color yellow "[HF] Download failed with rc=$rc"
+    fi
+
+    if [[ "$INTERRUPTED" -eq 1 ]]; then
+      warn "Interrupted by user, aborting retries."
+      return 130
     fi
 
     color yellow "[HF] Sleep ${sleep_secs}s then retry..."
@@ -653,20 +833,45 @@ ms_model_download_with_retry() {
   local sleep_secs="$SLEEP_SECS"
 
   for i in $(seq 1 "$MAX_RETRIES"); do
+    if [[ "$INTERRUPTED" -eq 1 ]]; then
+      warn "Interrupted by user, aborting retries."
+      return 130
+    fi
+
     local log="/tmp/downhub_ms_attempt_${i}.log"
+    : > "$log"
     color blue "[MS] Attempt $i/$MAX_RETRIES ... log=$log"
 
     set +e
-    ms_model_download_once "$py" "$repo_id" "$real_dir" 2>&1 | tee "$log"
-    rc=${PIPESTATUS[0]}
+    ms_model_download_once "$py" "$repo_id" "$real_dir" > >(tee "$log") 2>&1 &
+    ACTIVE_CHILD_PID=$!
+    wait_with_watchdog "$ACTIVE_CHILD_PID" "$log" "MS"
+    rc=$?
+    ACTIVE_CHILD_PID=""
     set -e
+
+    if [[ $rc -eq 130 || "$INTERRUPTED" -eq 1 ]]; then
+      warn "Download interrupted by user (Ctrl+C)."
+      return 130
+    fi
 
     if [[ $rc -eq 0 ]]; then
       color green "[MS] Download finished."
       return 0
     fi
 
-    color yellow "[MS] Download failed with rc=$rc"
+    if [[ $rc -eq 124 ]]; then
+      color yellow "[MS] Detected stall (no log growth)."
+      color yellow "Tip: check network/proxy, then script will retry with resume."
+    else
+      color yellow "[MS] Download failed with rc=$rc"
+    fi
+
+    if [[ "$INTERRUPTED" -eq 1 ]]; then
+      warn "Interrupted by user, aborting retries."
+      return 130
+    fi
+
     color yellow "[MS] Sleep ${sleep_secs}s then retry..."
     sleep "$sleep_secs"
     if [[ "$sleep_secs" -lt 600 ]]; then
@@ -723,6 +928,21 @@ fi
 
 if ! validate_positive_int "$CONNECT_TIMEOUT"; then
   error "CONNECT_TIMEOUT must be a positive integer. Current: $CONNECT_TIMEOUT"
+  exit 2
+fi
+
+if ! validate_non_negative_int "$STALL_TIMEOUT"; then
+  error "STALL_TIMEOUT must be a non-negative integer. Current: $STALL_TIMEOUT"
+  exit 2
+fi
+
+if ! validate_positive_int "$WATCHDOG_INTERVAL"; then
+  error "WATCHDOG_INTERVAL must be a positive integer. Current: $WATCHDOG_INTERVAL"
+  exit 2
+fi
+
+if ! validate_bool01 "$AUTO_RELINK_NON_SYMLINK"; then
+  error "AUTO_RELINK_NON_SYMLINK must be 0 or 1. Current: $AUTO_RELINK_NON_SYMLINK"
   exit 2
 fi
 

@@ -84,12 +84,26 @@ class _QWen_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen2.5-VL-3B-Instruct")
+        attn_impl = qwenvl_config.get("attn_implementation", "flash_attention_2")
 
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id,
-            attn_implementation="flash_attention_2",
-            torch_dtype="auto",
-        )
+        try:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_id,
+                attn_implementation=attn_impl,
+                torch_dtype="auto",
+            )
+        except ImportError as e:
+            if attn_impl == "flash_attention_2":
+                logger.warning(
+                    f"flash_attention_2 unavailable for `{model_id}`, fallback to eager attention: {e}"
+                )
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_id,
+                    attn_implementation="eager",
+                    torch_dtype="auto",
+                )
+            else:
+                raise
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 

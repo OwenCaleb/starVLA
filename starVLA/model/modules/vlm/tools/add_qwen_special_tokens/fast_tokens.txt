@@ -2046,3 +2046,15 @@
 <robot_action_2045>
 <robot_action_2046>
 <robot_action_2047>
+<slot_dynamic>
+<slot_spatial>
+<slot_subtask>
+<slot_action>
+<SOSD>
+<EOSD>
+<SOSS>
+<EOSS>
+<SOST>
+<EOST>
+<SOSA>
+<EOSA>

@@ -10,8 +10,23 @@ from typing import List, Dict, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import AutoTokenizer, AutoProcessor
 from transformers import Qwen3VLForConditionalGeneration
+
+DEFAULT_SLOT_TOKENS = [
+    "<slot_dynamic>",
+    "<slot_spatial>",
+    "<slot_subtask>",
+    "<slot_action>",
+    "<SOSD>",
+    "<EOSD>",
+    "<SOSS>",
+    "<EOSS>",
+    "<SOST>",
+    "<EOST>",
+    "<SOSA>",
+    "<EOSA>",
+]
 
 def add_new_tokens(
     model,
@@ -130,11 +145,23 @@ def parse_tokens(args) -> List[str]:
             ordered.append(t)
     return ordered
 
+
+def extend_with_default_slot_tokens(tokens: List[str], enable: bool = True) -> List[str]:
+    if not enable:
+        return tokens
+    seen = set(tokens)
+    ordered = list(tokens)
+    for token in DEFAULT_SLOT_TOKENS:
+        if token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    return ordered
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Add special tokens to Qwen2.5-VL model and save to local directory."
+        description="Add special tokens to Qwen3-VL model and save to local directory."
     )
-    parser.add_argument("--model-id", default="Qwen/Qwen2.5-VL-3B-Instruct", help="HF Hub model ID or local path")
+    parser.add_argument("--model-id", default="./playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action", help="HF Hub model ID or local path")
     parser.add_argument("--save-dir", required=True, help="Output directory to save")
     parser.add_argument("--tokens", default="", help="Comma-separated tokens, e.g., <loc_x>,<loc_y>")
     parser.add_argument("--tokens-file", help="Text file containing tokens to add (one per line)")
@@ -142,11 +169,15 @@ def main():
     parser.add_argument("--as-special", action="store_true", help="Whether to add as special tokens")
     parser.add_argument("--no-as-special", dest="as_special", action="store_false")
     parser.set_defaults(as_special=True)
+    parser.add_argument("--include-default-slot-tokens", dest="include_default_slot_tokens", action="store_true", help="Also add starVLA slot/boundary tokens")
+    parser.add_argument("--no-include-default-slot-tokens", dest="include_default_slot_tokens", action="store_false")
+    parser.set_defaults(include_default_slot_tokens=True)
     parser.add_argument("--padding-side", default="left", choices=["left", "right"])
     parser.add_argument("--device", default="cuda", help="cuda / cpu / mps / auto")
     args = parser.parse_args()
 
     tokens = parse_tokens(args)
+    tokens = extend_with_default_slot_tokens(tokens, enable=args.include_default_slot_tokens)
     if not tokens:
         print("No tokens provided, use --tokens or --tokens-file")
         return
@@ -156,19 +187,19 @@ def main():
     print(f"[INFO] Loading model: {args.model_id}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     tokenizer.padding_side = args.padding_side
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model_id,
-        torch_dtype="auto",
-        device_map="auto" if args.device == "auto" else None,
-        trust_remote_code=True,
-    )
-
-    # model = Qwen3VLForConditionalGeneration.from_pretrained(
+    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     #     args.model_id,
-    #     attn_implementation="flash_attention_2",
-    #     dtype=torch.bfloat16,
-    #     device_map="cuda",
+    #     torch_dtype="auto",
+    #     device_map="auto" if args.device == "auto" else None,
+    #     trust_remote_code=True,
     # )
+
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        args.model_id,
+        attn_implementation="flash_attention_2",
+        dtype=torch.bfloat16,
+        device_map="cuda",
+    )
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
     processor.tokenizer.padding_side = "left"
 

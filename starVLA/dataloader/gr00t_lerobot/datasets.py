@@ -602,6 +602,7 @@ class LeRobotSingleDataset(Dataset):
         self.delete_pause_frame = delete_pause_frame
 
         self.modality_configs = modality_configs
+        self._apply_yaml_modality_overrides()
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs if video_backend_kwargs is not None else {}
         self.transforms = (
@@ -641,6 +642,56 @@ class LeRobotSingleDataset(Dataset):
 
         # Check if the dataset is valid
         self._check_integrity()
+
+    def _apply_yaml_modality_overrides(self) -> None:
+        """Apply lightweight modality index overrides from YAML.
+
+        This reuses the existing LeRobot data flow and only changes which
+        temporal indices are sampled for configured modalities.
+        """
+        if self.data_cfg is None:
+            return
+
+        def _to_int_list(value):
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple)):
+                return [int(v) for v in value]
+            # OmegaConf/AccessTrackedConfig list-like wrappers
+            if hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict)):
+                return [int(v) for v in list(value)]
+            return [int(value)]
+
+        # Generic overrides (if provided)
+        obs_indices = _to_int_list(self.data_cfg.get("observation_indices", None))
+        action_indices = _to_int_list(self.data_cfg.get("action_indices", None))
+        state_indices = _to_int_list(self.data_cfg.get("state_indices", None))
+
+        # MyVLA temporal override for LAM teacher (supports i and i+di)
+        temporal_video_delta_indices = _to_int_list(self.data_cfg.get("temporal_video_delta_indices", None))
+
+        if "video" in self.modality_configs:
+            if temporal_video_delta_indices is not None and len(temporal_video_delta_indices) > 0:
+                self.modality_configs["video"].delta_indices = temporal_video_delta_indices
+                print(
+                    f"[data_cfg] override video delta_indices with temporal_video_delta_indices="
+                    f"{temporal_video_delta_indices}"
+                )
+            elif obs_indices is not None and len(obs_indices) > 0:
+                self.modality_configs["video"].delta_indices = obs_indices
+                print(f"[data_cfg] override video delta_indices with observation_indices={obs_indices}")
+
+        if "language" in self.modality_configs and obs_indices is not None and len(obs_indices) > 0:
+            self.modality_configs["language"].delta_indices = obs_indices
+            print(f"[data_cfg] override language delta_indices with observation_indices={obs_indices}")
+
+        if "action" in self.modality_configs and action_indices is not None and len(action_indices) > 0:
+            self.modality_configs["action"].delta_indices = action_indices
+            print(f"[data_cfg] override action delta_indices with action_indices={action_indices}")
+
+        if "state" in self.modality_configs and state_indices is not None and len(state_indices) > 0:
+            self.modality_configs["state"].delta_indices = state_indices
+            print(f"[data_cfg] override state delta_indices with state_indices={state_indices}")
 
     @property
     def dataset_path(self) -> Path:
@@ -1353,9 +1404,16 @@ class LeRobotSingleDataset(Dataset):
         """Pack transformed modality data into training sample format."""
         prim_images = []
         wrist_views = []
+        video_key_to_frames = {}
         for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
+            frames = data[video_key]
+            if len(frames) == 0:
+                continue
+            video_key_to_frames[video_key] = [
+                Image.fromarray(frame).resize((224, 224)) for frame in frames
+            ]
+
+            image = video_key_to_frames[video_key][0]
             if "wrist" not in video_key:
                 prim_images.append(image)
             else:
@@ -1374,6 +1432,27 @@ class LeRobotSingleDataset(Dataset):
             "lang": language,
             "language": language,
         }
+
+        # Provide explicit temporal input for LAM teacher.
+        # Priority: temporal_video_key -> obs mapping -> first available video key.
+        temporal_key = None
+        if self.data_cfg is not None:
+            temporal_key = self.data_cfg.get("temporal_video_key", None)
+
+            if temporal_key is None:
+                obs_list = self.data_cfg.get("obs", None)
+                if isinstance(obs_list, (list, tuple)) and len(obs_list) > 0:
+                    obs_name = str(obs_list[0])
+                    for video_key in self.modality_keys["video"]:
+                        if obs_name in video_key:
+                            temporal_key = video_key
+                            break
+
+        if temporal_key is None and len(self.modality_keys["video"]) > 0:
+            temporal_key = self.modality_keys["video"][0]
+
+        if temporal_key in video_key_to_frames:
+            sample["video"] = video_key_to_frames[temporal_key]
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             state = []

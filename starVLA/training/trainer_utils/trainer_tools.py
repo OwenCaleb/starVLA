@@ -16,6 +16,71 @@ from accelerate.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _parse_freeze_specs(freeze_modules) -> list[str]:
+    if not isinstance(freeze_modules, str):
+        return []
+    return [p.strip() for p in freeze_modules.split(",") if p.strip()]
+
+
+def _resolve_frozen_param_ids(model, freeze_modules) -> tuple[set[int], dict[str, int], list[str]]:
+    """Resolve frozen parameter ids from module paths and param regex specs.
+
+    Supported specs in freeze_modules (comma separated):
+      - module path: "qwen_vl_interface.model.lm_head"
+      - parameter regex: "param_regex:\\.self_attn\\."
+    """
+
+    specs = _parse_freeze_specs(freeze_modules)
+    frozen_param_ids: set[int] = set()
+    matched_counts: dict[str, int] = {}
+    warnings: list[str] = []
+
+    named_params = list(model.named_parameters())
+
+    for spec in specs:
+        if spec.startswith("param_regex:"):
+            pattern = spec[len("param_regex:") :]
+            try:
+                regex = re.compile(pattern)
+            except re.error as exc:
+                warnings.append(f"⚠️ invalid freeze regex `{pattern}`: {exc}")
+                matched_counts[spec] = 0
+                continue
+
+            matched = 0
+            for name, param in named_params:
+                if regex.search(name):
+                    frozen_param_ids.add(id(param))
+                    matched += 1
+            matched_counts[spec] = matched
+            if matched == 0:
+                warnings.append(f"⚠️ freeze regex matched 0 parameters: {spec}")
+            continue
+
+        module = model
+        try:
+            for attr in spec.split("."):
+                module = getattr(module, attr)
+        except AttributeError:
+            warnings.append(f"⚠️ freeze module path does not exist: {spec}")
+            matched_counts[spec] = 0
+            continue
+
+        if module is None or not hasattr(module, "parameters"):
+            warnings.append(f"⚠️ freeze module path is not a nn.Module: {spec}")
+            matched_counts[spec] = 0
+            continue
+
+        params = list(module.parameters())
+        matched_counts[spec] = len(params)
+        if len(params) == 0:
+            warnings.append(f"⚠️ freeze module path has 0 parameters: {spec}")
+        for param in params:
+            frozen_param_ids.add(id(param))
+
+    return frozen_param_ids, matched_counts, warnings
+
+
 # === Define Tracker Interface ===
 #
 
@@ -65,23 +130,10 @@ def build_param_lr_groups(model, cfg):
     base_lr = lr_cfg.get("base", 1e-4)  # default base learning rate
 
     freeze_modules = cfg.trainer.get("freeze_modules", "")
-    if not isinstance(freeze_modules, str):
-        freeze_modules = ""
-    freeze_patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()]
 
     used_params = set()
-    frozen_params = set()
+    frozen_params, _, _ = _resolve_frozen_param_ids(model, freeze_modules)
     param_groups = []
-
-    for freeze_path in freeze_patterns:
-        module = model
-        try:
-            for attr in freeze_path.split("."):
-                module = getattr(module, attr)
-            frozen_params.update(id(p) for p in module.parameters())
-        except AttributeError:
-            print(f"⚠️ freeze module path does not exist: {freeze_path}")
-            continue
 
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
@@ -165,27 +217,20 @@ class TrainerUtils:
           - model:
         """
         frozen = []
-        print("#"*30)
+        print("#" * 30)
         print(freeze_modules)
-        if freeze_modules and type(freeze_modules) == str:
-            # split and remove whitespace
-            patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()] if freeze_modules else []
+        frozen_param_ids, matched_counts, warnings = _resolve_frozen_param_ids(model, freeze_modules)
 
-            for path in patterns:
-                # split the "relative path" by dots, for example "action_model.net" → ["action_model", "net"]
-                attrs = path.split(".")
-                module = model
-                try:
-                    for attr in attrs:
-                        module = getattr(module, attr)
-                    # if the module is successfully get, freeze it and its all submodule parameters
-                    for param in module.parameters():
-                        param.requires_grad = False
-                    frozen.append(path)
-                except AttributeError:
-                    # if the attribute does not exist, skip and print warning
-                    print(f"⚠️ module path does not exist, cannot freeze: {path}")
-                    continue
+        for param in model.parameters():
+            if id(param) in frozen_param_ids:
+                param.requires_grad = False
+
+        for spec, matched in matched_counts.items():
+            if matched > 0:
+                frozen.append(f"{spec} ({matched} params)")
+
+        for warning in warnings:
+            print(warning)
 
         # accelerator.wait_for_everyone()  # synchronize when distributed training
         if not dist.is_initialized() or dist.get_rank() == 0:
