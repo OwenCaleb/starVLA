@@ -272,31 +272,31 @@ class DepthAnythingV2Encoder(nn.Module):
 		"""Encode starVLA batch examples.
 
 		Semantics:
-		- prefer `sample['video']` as temporal input and take the later frame for spatial target
-		- fall back to `sample['image']` as same-timestep multi-view image list for compatibility
+		- prefer `sample['image']` as the current-timestep spatial input
+		- fall back to `sample['video']` only when the current image is unavailable
 		- return per-sample depth stacks and a pooled depth summary
 		"""
 		def _select_spatial_images(sample: dict):
+			images = sample.get("image")
+			if isinstance(images, (list, tuple)) and len(images) > 0:
+				return list(images)
+
 			video = sample.get("video")
 			if video is not None:
 				if isinstance(video, (list, tuple)) and len(video) > 0:
-					last_frame = video[-1]
-					return [last_frame] if not isinstance(last_frame, (list, tuple)) else list(last_frame)
+					first_frame = video[0]
+					return [first_frame] if not isinstance(first_frame, (list, tuple)) else list(first_frame)
 				if isinstance(video, torch.Tensor):
 					if video.ndim == 4:
-						frame = video[-1].detach().cpu()
+						frame = video[0].detach().cpu()
 					elif video.ndim == 5:
-						frame = video[0, -1].detach().cpu()
+						frame = video[0, 0].detach().cpu()
 					else:
 						raise ValueError(f"Unsupported temporal video tensor shape: {tuple(video.shape)}")
 					if frame.ndim == 3 and frame.shape[0] in (1, 3):
 						frame = frame.permute(1, 2, 0)
 					frame_np = frame.numpy()
 					return [frame_np]
-
-			images = sample.get("image")
-			if isinstance(images, list) and len(images) > 0:
-				return images
 			raise ValueError("Each sample must provide a non-empty list in sample['video'] or sample['image']")
 
 		batch_depth = []

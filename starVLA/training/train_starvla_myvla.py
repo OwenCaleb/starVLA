@@ -52,12 +52,14 @@ def build_accelerator(cfg):
 
     Debug or single-process runs should not require DeepSpeed/MPI.
     """
+    enable_mixed_precision = bool(getattr(cfg.trainer, "enable_mixed_precision_training", False))
+    mixed_precision = "bf16" if enable_mixed_precision else "no"
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if getattr(cfg, "is_debug", False) or world_size == 1:
-        accelerator = Accelerator()
+        accelerator = Accelerator(mixed_precision=mixed_precision)
     else:
         deepspeed_plugin = DeepSpeedPlugin()
-        accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+        accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin, mixed_precision=mixed_precision)
 
     accelerator.print(accelerator.state)
     return accelerator
@@ -138,6 +140,17 @@ def validate_stage_configuration(cfg) -> None:
     """
     def _warn(message: str) -> None:
         print(f"[stage-config-warning] {message}")
+
+    def _as_string_list(value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        try:
+            return [str(item) for item in list(value) if str(item)]
+        except TypeError:
+            text = str(value)
+            return [text] if text else []
 
     stage_name = getattr(cfg.trainer, "stage_name", None)
     if stage_name is None:
@@ -236,15 +249,26 @@ def validate_stage_configuration(cfg) -> None:
                     _warn(f"attention_mask.stage_visibility.{stage_name}.action is missing `action` column")
 
     freeze_modules = str(getattr(cfg.trainer, "freeze_modules", "") or "").strip()
-    if stage_name in {"stage1", "stage2"} and not freeze_modules:
-        _warn(f"Stage `{stage_name}` expects non-empty trainer.freeze_modules for explicit freeze policy.")
-    if stage_name == "stage1":
-        if "param_regex:\\.self_attn\\." not in freeze_modules:
-            _warn("Stage `stage1` recommends freezing self-attention via `param_regex:\\.self_attn\\.`")
-        if "param_regex:\\.mlp\\.experts\\.action\\." not in freeze_modules:
-            _warn("Stage `stage1` recommends freezing Action-FFN via `param_regex:\\.mlp\\.experts\\.action\\.`")
-    if stage_name == "stage2" and "action_predictor" not in freeze_modules:
-        _warn("Stage `stage2` recommends freezing continuous action head via `action_predictor`")
+
+    lora_cfg = getattr(getattr(cfg, "framework", None), "get", lambda *_args, **_kwargs: {})("lora", {})
+    lora_enable = bool(lora_cfg.get("enable", False))
+    if lora_enable:
+        target_modules = lora_cfg.get("target_modules", None)
+        exclude_modules = _as_string_list(lora_cfg.get("exclude_modules", []))
+        if not target_modules:
+            _warn("framework.lora.enable=true but framework.lora.target_modules is empty")
+        if "base_mlp" not in exclude_modules:
+            _warn("framework.lora is enabled but `base_mlp` is not excluded; Base-FFN may no longer stay frozen")
+    else:
+        if stage_name in {"stage1", "stage2"} and not freeze_modules:
+            _warn(f"Stage `{stage_name}` expects non-empty trainer.freeze_modules for explicit freeze policy.")
+        if stage_name == "stage1":
+            if "param_regex:\\.self_attn\\." not in freeze_modules:
+                _warn("Stage `stage1` recommends freezing self-attention via `param_regex:\\.self_attn\\.`")
+            if "param_regex:\\.mlp\\.experts\\.action\\." not in freeze_modules:
+                _warn("Stage `stage1` recommends freezing Action-FFN via `param_regex:\\.mlp\\.experts\\.action\\.`")
+        if stage_name == "stage2" and "action_predictor" not in freeze_modules:
+            _warn("Stage `stage2` recommends freezing continuous action head via `action_predictor`")
 
     save_mode = str(getattr(cfg.trainer, "save_mode", "step")).lower()
     if save_mode not in {"step", "epoch"}:
@@ -484,11 +508,24 @@ class VLATrainer(TrainerUtils):
             self.completed_steps = 0
 
         if pretrained_checkpoint:
-            reload_modules = getattr(self.config.trainer, "reload_modules", None)
-            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
-            self.completed_steps = 0
+            if getattr(self.model, "_preloaded_from_checkpoint", False):
+                logger.info(
+                    f"Model already loaded pretrained checkpoint in framework init: {pretrained_checkpoint}"
+                )
+            else:
+                reload_modules = getattr(self.config.trainer, "reload_modules", None)
+                self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+
+            # Support override via resume_step if explicitly specified
+            resume_step = getattr(self.config.trainer, "resume_step", None)
+            if resume_step is not None:
+                self.completed_steps = int(resume_step)
+                logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, resuming from step {self.completed_steps}")
+            else:
+                self.completed_steps = 0
+                logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
+            
             self.resume_from_checkpoint = pretrained_checkpoint
-            logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
         else:
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
@@ -497,8 +534,19 @@ class VLATrainer(TrainerUtils):
         """Adjust LR scheduler state after resuming from non-zero steps."""
         if self.completed_steps > 0:
             logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
-            for _ in range(self.completed_steps):
-                self.lr_scheduler.step()
+            # Keep historical behavior with O(1) restore.
+            # For HuggingFace schedulers used here, `step(completed_steps)`
+            # matches iterative replay of `completed_steps` calls.
+            target_epoch = max(int(self.completed_steps), 0)
+            try:
+                self.lr_scheduler.step(target_epoch)
+            except Exception as exc:
+                logger.warning(
+                    "Fast scheduler restore failed (%s); falling back to iterative replay.",
+                    exc,
+                )
+                for _ in range(self.completed_steps):
+                    self.lr_scheduler.step()
             logger.info(
                 f"LR scheduler adjusted to step {self.completed_steps}, current LR: {self.lr_scheduler.get_last_lr()}"
             )
@@ -563,7 +611,6 @@ class VLATrainer(TrainerUtils):
             "slot_subtask_total",
             "continuous_fm_loss",
             "fast_action_loss",
-            "supervised_action_loss",
         ]
         weight_keys = ["w_slot_dynamic", "w_slot_spatial", "w_slot_subtask", "w_continuous", "w_fast"]
         timing_keys = ["data_time", "model_time"]
@@ -591,6 +638,15 @@ class VLATrainer(TrainerUtils):
             lines.append("  losses: " + " | ".join(loss_parts))
         if slot_parts:
             lines.append("  slots:  " + " | ".join(slot_parts))
+        fast_parts = [
+            part
+            for key in ("fast_label_token_count", "fast_token_correct")
+            if (part := _fmt(key, digits=0)) is not None
+        ]
+        if (part := _fmt("fast_token_accuracy")) is not None:
+            fast_parts.append(part)
+        if fast_parts:
+            lines.append("  fast:   " + " | ".join(fast_parts))
 
         weight_parts = [part for key in weight_keys if (part := _fmt(key, digits=3)) is not None]
         if weight_parts:
@@ -668,7 +724,26 @@ class VLATrainer(TrainerUtils):
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
-        output_dict = self.model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
+        predict_kwargs = {"use_ddim": True, "num_ddim_steps": 20}
+        stage_name = str(getattr(self.config.trainer, "stage_name", "")).lower()
+        enable_fast_eval = bool(getattr(self.config.trainer, "eval_fast_inference", False))
+        if stage_name == "stage2" and enable_fast_eval:
+            predict_kwargs["fast_inference"] = True
+
+        try:
+            output_dict = self.model.predict_action(examples=examples, **predict_kwargs)
+        except RuntimeError as exc:
+            if stage_name == "stage2" and enable_fast_eval and "valid token prefix" in str(exc):
+                if self.accelerator.is_main_process:
+                    logger.warning(
+                        "Stage II FAST eval skipped: model did not produce a valid FAST action prefix yet."
+                    )
+                    step_metrics["fast_eval_decode_ok"] = 0.0
+                    step_metrics["mse_score"] = float("nan")
+                del examples
+                _maybe_barrier()
+                return step_metrics
+            raise
 
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
@@ -676,6 +751,8 @@ class VLATrainer(TrainerUtils):
             num_pots = np.prod(actions.shape)
             score = TrainerUtils.euclidean_distance(normalized_actions, actions)
             step_metrics["mse_score"] = score / num_pots
+            if stage_name == "stage2" and enable_fast_eval:
+                step_metrics["fast_eval_decode_ok"] = 1.0
 
         del examples
         _maybe_barrier()
@@ -739,8 +816,9 @@ class VLATrainer(TrainerUtils):
                 metrics["continuous_fm_loss"] = float(output_dict["continuous_fm_loss"].item())
             if "fast_action_loss" in output_dict:
                 metrics["fast_action_loss"] = float(output_dict["fast_action_loss"].item())
-            if "supervised_action_loss" in output_dict:
-                metrics["supervised_action_loss"] = float(output_dict["supervised_action_loss"].item())
+            for fast_key in ("fast_label_token_count", "fast_token_correct", "fast_token_accuracy"):
+                if fast_key in output_dict:
+                    metrics[fast_key] = float(output_dict[fast_key])
 
             slot_breakdown = output_dict.get("slot_align_loss_breakdown")
             if isinstance(slot_breakdown, dict):

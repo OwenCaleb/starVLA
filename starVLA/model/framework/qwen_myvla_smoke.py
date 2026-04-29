@@ -32,7 +32,11 @@ def _build_mock_model(*, enable_fast_loss: bool, fast_detach: bool) -> QwenMyVLA
 
     model = QwenMyVLA.__new__(QwenMyVLA)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(framework={})
+    model.config = SimpleNamespace(
+        framework={},
+        datasets=SimpleNamespace(vla_data=SimpleNamespace(image_size=None)),
+        trainer={},
+    )
     model.hidden_size = hidden_size
     model.k_dyn = k_dyn
     model.k_spa = k_spa
@@ -87,7 +91,16 @@ def _build_mock_model(*, enable_fast_loss: bool, fast_detach: bool) -> QwenMyVLA
     model.fast_action_loss_weight_start = 1.0
     model.fast_action_loss_weight_end = 1.0
     model.fast_action_loss_detach = fast_detach
-    model.fast_action_model = object() if enable_fast_loss else None
+    model.fast_action_token_ids = set()
+
+    class _FakeFastActionModel:
+        def __init__(self):
+            self.fast_tokenizer = SimpleNamespace(time_horizon=None, action_dim=None)
+
+        def encoder_action2fastoken(self, actions):
+            return [[1, 2, 3, 4] for _ in actions]
+
+    model.fast_action_model = _FakeFastActionModel() if enable_fast_loss else None
 
     model.continuous_fm_loss_weight = 1.0
     model.continuous_fm_loss_weight_start = 1.0
@@ -117,12 +130,6 @@ def _build_mock_model(*, enable_fast_loss: bool, fast_detach: bool) -> QwenMyVLA
         nn.Linear(hidden_size * 3, hidden_size),
         nn.GELU(),
         nn.Linear(hidden_size, chunk_len * action_dim),
-    )
-    model.coarse_action_state_proj = nn.Sequential(
-        nn.LayerNorm(action_dim),
-        nn.Linear(action_dim, hidden_size),
-        nn.GELU(),
-        nn.Linear(hidden_size, hidden_size),
     )
 
     model.dynamic_projector = TokenAwareResampler(in_dim=8, out_dim=hidden_size, num_slots=k_dyn)
@@ -311,6 +318,36 @@ def all_layer_typed_attention_apply_smoke_test() -> None:
     print("[OK] QwenMyVLA all-layer typed attention apply smoke passed")
 
 
+def attn_implementation_guard_smoke_test() -> None:
+    def _build_model(attn_impl: str) -> QwenMyVLA:
+        model = QwenMyVLA.__new__(QwenMyVLA)
+        nn.Module.__init__(model)
+        text_cfg = SimpleNamespace(_attn_implementation=attn_impl)
+        root_cfg = SimpleNamespace(_attn_implementation=attn_impl, text_config=text_cfg)
+        model.qwen_vl_interface = SimpleNamespace(model=SimpleNamespace(config=root_cfg))
+        return model
+
+    flash_model = _build_model("flash_attention_2")
+    assert flash_model._is_flash_attention_2_active() is True
+
+    eager_model = _build_model("eager")
+    assert eager_model._is_flash_attention_2_active() is False
+
+    sdpa_model = _build_model("sdpa")
+    assert sdpa_model._is_flash_attention_2_active() is False
+
+    enable_back_half_typed_attention = True
+    if enable_back_half_typed_attention and flash_model._is_flash_attention_2_active():
+        enable_back_half_typed_attention = False
+    assert enable_back_half_typed_attention is False
+
+    enable_back_half_typed_attention = True
+    if enable_back_half_typed_attention and sdpa_model._is_flash_attention_2_active():
+        enable_back_half_typed_attention = False
+    assert enable_back_half_typed_attention is True
+    print("[OK] Attention implementation guard smoke passed")
+
+
 def masked_target_prediction_slot_align_smoke_test() -> None:
     model = QwenMyVLA.__new__(QwenMyVLA)
     nn.Module.__init__(model)
@@ -432,6 +469,153 @@ def freeze_policy_smoke_test() -> None:
     print("[OK] Freeze policy smoke passed")
 
 
+def typed_ffn_stage_trainability_smoke_test() -> None:
+    class _DummyLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = nn.Sequential(nn.Linear(8, 16), nn.GELU(), nn.Linear(16, 8))
+
+    def _build_wrapped_layer(stage_name: str, enable_stage3_action_header: bool, train_stages=None):
+        model = QwenMyVLA.__new__(QwenMyVLA)
+        nn.Module.__init__(model)
+        model.stage_name = stage_name
+        if train_stages is None:
+            train_stages = ["stage2", "stage3"]
+        model.config = SimpleNamespace(
+            framework={
+                "typed_ffn_train": {"train_stages": train_stages},
+                "stage3_action_header": {"enable": enable_stage3_action_header},
+            }
+        )
+        model.typed_ffn_train_stages = {str(x).lower() for x in train_stages}
+        model.moe_wrapped_layers = []
+
+        layer = _DummyLayer()
+        model._resolve_text_backbone_and_layers = lambda: (object(), [layer])
+        model._attach_typed_ffn_moe()
+        return layer
+
+    stage1_layer = _build_wrapped_layer("stage1", False)
+    assert isinstance(stage1_layer.mlp, TypedResidualFFN)
+    assert stage1_layer.mlp.base_mlp[0].weight.requires_grad is False
+    assert stage1_layer.mlp.experts["dynamic"][0].weight.requires_grad is True
+
+    stage2_layer = _build_wrapped_layer("stage2", False)
+    assert isinstance(stage2_layer.mlp, TypedResidualFFN)
+    assert stage2_layer.mlp.base_mlp[0].weight.requires_grad is False
+    assert stage2_layer.mlp.experts["dynamic"][0].weight.requires_grad is True
+
+    stage3_layer = _build_wrapped_layer("stage3", True)
+    assert isinstance(stage3_layer.mlp, TypedResidualFFN)
+    assert stage3_layer.mlp.base_mlp[0].weight.requires_grad is False
+    assert stage3_layer.mlp.experts["dynamic"][0].weight.requires_grad is True
+
+    print("[OK] TypedResidualFFN stage trainability smoke passed")
+
+
+def lora_target_resolution_smoke_test() -> None:
+    class _DummyQwenBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_mlp = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+            self.lm_head = nn.Linear(4, 4)
+            self.experts = nn.ModuleDict({
+                "dynamic": nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4)),
+                "spatial": nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4)),
+            })
+            self.attn = nn.Linear(4, 4)
+
+        def forward(self, x):
+            x = self.attn(x)
+            x = self.base_mlp(x)
+            return self.experts["dynamic"](x)
+
+    model = QwenMyVLA.__new__(QwenMyVLA)
+    nn.Module.__init__(model)
+    model.enable_lora = True
+    model.lora_rank = 2
+    model.lora_alpha = 2
+    model.lora_dropout = 0.0
+    model.lora_target_modules = "all-linear"
+    model.lora_exclude_modules = ["base_mlp"]
+    model.lora_bias = "none"
+    model.lora_init_weights = "gaussian"
+    model.qwen_vl_interface = SimpleNamespace(model=_DummyQwenBackbone())
+
+    resolved_targets = model._resolve_lora_target_module_names()
+    assert any("attn" == name for name in resolved_targets)
+    assert any("experts.dynamic" in name for name in resolved_targets)
+    assert not any("base_mlp" in name for name in resolved_targets)
+    assert not any("lm_head" in name for name in resolved_targets)
+
+    model._attach_qwen_lora()
+    wrapped_model = model.qwen_vl_interface.model
+
+    lora_module_names = [name for name, module in wrapped_model.named_modules() if hasattr(module, "lora_A")]
+    assert any("attn" in name for name in lora_module_names)
+    assert any("experts.dynamic" in name for name in lora_module_names)
+    assert not any("base_mlp" in name for name in lora_module_names)
+    assert not any("lm_head" in name for name in lora_module_names)
+
+    print("[OK] LoRA target resolution smoke passed")
+
+
+def fast_action_tokenizer_init_smoke_test() -> None:
+    model = _build_mock_model(enable_fast_loss=True, fast_detach=False)
+    assert model.fast_action_model is not None
+    assert model.fast_action_model.fast_tokenizer.time_horizon is None
+    assert model.fast_action_model.fast_tokenizer.action_dim is None
+
+    model._configure_fast_action_tokenizer()
+
+    assert model.fast_action_model.fast_tokenizer.time_horizon == model.num_actions_chunk
+    assert model.fast_action_model.fast_tokenizer.action_dim == model.action_dim
+    print("[OK] Fast action tokenizer init smoke passed")
+
+
+def lora_modules_to_save_smoke_test() -> None:
+    class _DummyQwenBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_mlp = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+            self.lm_head = nn.Linear(4, 4)
+            self.experts = nn.ModuleDict({
+                "dynamic": nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4)),
+                "spatial": nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4)),
+            })
+            self.attn = nn.Linear(4, 4)
+
+        def forward(self, x):
+            x = self.attn(x)
+            x = self.base_mlp(x)
+            return self.experts["dynamic"](x)
+
+    model = QwenMyVLA.__new__(QwenMyVLA)
+    nn.Module.__init__(model)
+    model.enable_lora = True
+    model.lora_rank = 2
+    model.lora_alpha = 2
+    model.lora_dropout = 0.0
+    model.lora_target_modules = "all-linear"
+    model.lora_exclude_modules = ["base_mlp"]
+    model.lora_modules_to_save = ["lm_head"]
+    model.lora_bias = "none"
+    model.lora_init_weights = "gaussian"
+    model.qwen_vl_interface = SimpleNamespace(model=_DummyQwenBackbone())
+
+    resolved_modules_to_save = model._resolve_lora_modules_to_save()
+    assert resolved_modules_to_save == ["lm_head"]
+
+    model._attach_qwen_lora()
+    wrapped_model = model.qwen_vl_interface.model
+
+    lm_head_saved_params = [
+        name for name, param in wrapped_model.named_parameters() if "lm_head" in name and param.requires_grad
+    ]
+    assert any("modules_to_save" in name for name in lm_head_saved_params)
+    print("[OK] LoRA modules_to_save smoke passed")
+
+
 def slot_mask_config_smoke_test(config_yaml: str) -> None:
     cfg = OmegaConf.load(config_yaml)
 
@@ -510,27 +694,178 @@ def subtask_adapter_primary_path_smoke_test() -> None:
     print("[OK] Subtask adapter primary-path smoke passed")
 
 
-def stage3_coarse_condition_smoke_test() -> None:
+def stage3_m1_condition_and_sampling_smoke_test() -> None:
+    class _FakeDinoEncoder(nn.Module):
+        def __init__(self, hidden_size: int):
+            super().__init__()
+            self.dummy = nn.Parameter(torch.zeros(1))
+            self.num_channels = hidden_size
+
+        def prepare_dino_input(self, img_list):
+            batch_size = len(img_list)
+            views = len(img_list[0]) if batch_size > 0 else 1
+            device = next(self.parameters()).device
+            return torch.zeros((batch_size * views, 3, 8, 8), device=device)
+
+        def forward(self, tensor):
+            return torch.ones((tensor.shape[0], 5, self.num_channels), device=tensor.device)
+
+    class _FakeConditionFuser(nn.Module):
+        def __init__(self, output_dim: int, num_layers: int = 2, num_queries: int = 64):
+            super().__init__()
+            self.num_layers = num_layers
+            self.num_queries = num_queries
+            self.output_dim = output_dim
+
+        def forward(self, hidden_states_list, encoder_attention_mask=None):
+            del encoder_attention_mask
+            batch_size = hidden_states_list[0].shape[0]
+            device = hidden_states_list[0].device
+            return torch.zeros((batch_size, self.num_queries, self.output_dim), device=device)
+
+    class _FakeStage3Net(nn.Module):
+        def __init__(self, condition_dim: int):
+            super().__init__()
+            self.dummy = nn.Parameter(torch.zeros(1))
+            self.z_embedder = SimpleNamespace(uncondition=torch.zeros(64, condition_dim))
+
+        def forward(self, x, t, z):
+            del t, z
+            return torch.zeros_like(x)
+
+        def forward_with_cfg(self, x, t, z, cfg_scale):
+            del cfg_scale
+            return self.forward(x, t, z)
+
+    class _FakeDiffusion:
+        def p_sample_loop(self, model, shape, noise=None, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, device=None, progress=False):
+            del clip_denoised, denoised_fn, cond_fn, progress
+            x = noise if noise is not None else torch.zeros(shape, device=device)
+            t = torch.zeros((x.shape[0],), dtype=torch.long, device=x.device)
+            return model(x, t, **(model_kwargs or {}))
+
+        def ddim_sample_loop(self, model, shape, noise=None, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, device=None, progress=False, eta=0.0):
+            del eta
+            return self.p_sample_loop(
+                model,
+                shape,
+                noise=noise,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+                device=device,
+                progress=progress,
+            )
+
+    class _FakeStage3Head(nn.Module):
+        def __init__(self, action_dim: int, condition_dim: int, chunk_len: int):
+            super().__init__()
+            self.in_channels = action_dim
+            self.future_action_window_size = max(chunk_len - 1, 0)
+            self.past_action_window_size = 0
+            self.net = _FakeStage3Net(condition_dim)
+            self.diffusion = _FakeDiffusion()
+            self.ddim_diffusion = None
+
+        def forward(self, gt_action, condition, **kwargs):
+            del condition, kwargs
+            noise = torch.randn_like(gt_action)
+            return noise, noise, torch.zeros((gt_action.shape[0],), dtype=torch.long, device=gt_action.device)
+
+        def loss(self, noise_pred, noise):
+            return ((noise_pred - noise) ** 2).mean()
+
+        def create_ddim(self, ddim_step=10):
+            del ddim_step
+            self.ddim_diffusion = _FakeDiffusion()
+            return self.ddim_diffusion
+
     model = _build_mock_model(enable_fast_loss=False, fast_detach=False)
-    qwen_last_hidden = torch.randn((1, 24, model.hidden_size), dtype=torch.float32)
-    predicted_actions_light = torch.randn((1, model.num_actions_chunk, model.action_dim), dtype=torch.float32)
+    model.enable_stage3_action_header = True
+    model.enable_slot_mask = True
+    model.slot_mask_apply_in_eval = False
+    model.inner_mask_ratios = {"dynamic": 1.0, "spatial": 1.0, "subtask": 1.0}
+    model.outside_num_masked_probs = [0.0, 0.0, 0.0, 1.0]
+    model.stage3_dino_encoder = _FakeDinoEncoder(model.hidden_size)
+    model.stage3_dino_projector = nn.Identity()
+    model.stage3_condition_fuser = _FakeConditionFuser(output_dim=8, num_layers=2, num_queries=64)
+    model.stage3_action_head = _FakeStage3Head(action_dim=model.action_dim, condition_dim=8, chunk_len=model.num_actions_chunk)
 
-    action_pos = torch.tensor([[17, 18]], dtype=torch.long)
-    cond_from_action = model._build_stage3_coarse_condition(
-        qwen_last_hidden=qwen_last_hidden,
-        action_pos=action_pos,
-        predicted_actions_light=predicted_actions_light,
-    )
-    expected = qwen_last_hidden[:, 17:19, :].mean(dim=1)
-    assert torch.allclose(cond_from_action, expected)
+    class _CaptureEmbedding(nn.Module):
+        def __init__(self, hidden_size: int):
+            super().__init__()
+            self.embedding = nn.Embedding(256, hidden_size)
+            with torch.no_grad():
+                weight = torch.arange(256 * hidden_size, dtype=torch.float32).reshape(256, hidden_size)
+                self.embedding.weight.copy_(weight / 1000.0)
+            self.last_output = None
 
-    cond_fallback = model._build_stage3_coarse_condition(
-        qwen_last_hidden=qwen_last_hidden,
-        action_pos=None,
-        predicted_actions_light=predicted_actions_light,
-    )
-    assert cond_fallback.shape == (1, model.hidden_size)
-    print("[OK] Stage3 coarse-condition smoke passed")
+        def forward(self, input_ids):
+            output = self.embedding(input_ids)
+            self.last_output = output
+            return output
+
+    capture_embedding = _CaptureEmbedding(model.hidden_size)
+    model.qwen_vl_interface.model.model.embed = capture_embedding
+
+    samples = [{"image": [torch.zeros(3, 8, 8), torch.zeros(3, 8, 8)], "lang": "pick up the cup", "action": np.zeros((4, 7), dtype=np.float32)}]
+    model.train()
+    out_train = model.forward(examples=samples)
+    assert "action_loss" in out_train and out_train["action_loss"].ndim == 0
+
+    qwen_inputs = model.qwen_vl_interface.build_qwenvl_inputs(images=[samples[0]["image"]], instructions=[samples[0]["lang"]])
+    input_ids = qwen_inputs["input_ids"]
+    dyn_pos = model._gather_positions(input_ids, model.dynamic_token_id, model.k_dyn)
+    spa_pos = model._gather_positions(input_ids, model.spatial_token_id, model.k_spa)
+    sub_pos = model._gather_positions(input_ids, model.subtask_token_id, model.k_sub)
+    baseline_embeddings = capture_embedding(input_ids).detach().clone()
+
+    model.eval()
+    out_pred = model.predict_action(examples=samples, cfg_scale=1.0, use_ddim=True, num_ddim_steps=2)
+    assert out_pred["normalized_actions"].shape == (1, model.num_actions_chunk, model.action_dim)
+    masked_embeddings = capture_embedding.last_output.detach().to(dtype=baseline_embeddings.dtype)
+    assert torch.allclose(masked_embeddings[0, dyn_pos[0]], baseline_embeddings[0, dyn_pos[0]])
+    assert torch.allclose(masked_embeddings[0, spa_pos[0]], baseline_embeddings[0, spa_pos[0]])
+    assert torch.allclose(masked_embeddings[0, sub_pos[0]], baseline_embeddings[0, sub_pos[0]])
+    print("[OK] Stage3 M1-style condition and sampling smoke passed")
+
+
+def teacher_encoder_single_call_smoke_test() -> None:
+    model = _build_mock_model(enable_fast_loss=False, fast_detach=False)
+    call_counts = {"dynamic": 0, "spatial": 0, "subtask": 0}
+
+    def _dynamic_teacher(examples):
+        call_counts["dynamic"] += 1
+        return {
+            "indices": torch.zeros((len(examples), 1), dtype=torch.long),
+            "z_q": torch.randn((len(examples), 4, 8)),
+        }
+
+    def _spatial_teacher(examples):
+        call_counts["spatial"] += 1
+        return {
+            "encoder_tokens": torch.randn((len(examples), 6, 8)),
+            "token_mask": torch.ones((len(examples), 6), dtype=torch.bool),
+        }
+
+    def _subtask_teacher(examples):
+        call_counts["subtask"] += 1
+        return {
+            "text_tokens": torch.randn((len(examples), 5, 8)),
+            "text_mask": torch.ones((len(examples), 5), dtype=torch.bool),
+        }
+
+    model.dynamic_teacher_encoder = _dynamic_teacher
+    model.spatial_teacher_encoder = _spatial_teacher
+    model.subtask_slot_encoder = _subtask_teacher
+
+    samples = [{"image": [torch.zeros(3, 8, 8)], "lang": "pick up the cup", "action": np.zeros((4, 7), dtype=np.float32)}]
+    model.train()
+    _ = model.forward(examples=samples)
+
+    assert call_counts == {"dynamic": 1, "spatial": 1, "subtask": 1}
+    print("[OK] Teacher encoder single-call smoke passed")
 
 
 def curriculum_schedule_interpolation_smoke_test() -> None:
@@ -584,12 +919,18 @@ def main() -> None:
     loss_branch_semantics_smoke_test()
     typed_attention_mask_smoke_test()
     all_layer_typed_attention_apply_smoke_test()
+    attn_implementation_guard_smoke_test()
     masked_target_prediction_slot_align_smoke_test()
     main_forward_action_group_smoke_test()
     freeze_policy_smoke_test()
     stage2_attention_visibility_semantics_smoke_test()
     subtask_adapter_primary_path_smoke_test()
-    stage3_coarse_condition_smoke_test()
+    stage3_m1_condition_and_sampling_smoke_test()
+    teacher_encoder_single_call_smoke_test()
+    typed_ffn_stage_trainability_smoke_test()
+    fast_action_tokenizer_init_smoke_test()
+    lora_target_resolution_smoke_test()
+    lora_modules_to_save_smoke_test()
     curriculum_schedule_interpolation_smoke_test()
     if args.with_slot_mask_config:
         slot_mask_config_smoke_test(args.config_yaml)

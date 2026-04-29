@@ -30,3 +30,4 @@ diffusers
 timm
 tyro
 websockets
+peft==0.17.1

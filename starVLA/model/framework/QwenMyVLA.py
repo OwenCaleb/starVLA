@@ -22,14 +22,24 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from omegaconf import OmegaConf
+
+try:
+    from peft import LoraConfig, get_peft_model
+except ImportError:  # pragma: no cover - optional dependency guard
+    LoraConfig = None
+    get_peft_model = None
 
 from starVLA.model.framework.base_framework import baseframework
+from starVLA.model.modules.action_model.DiTActionHeader import ActionModel as DiTActionModel
 from starVLA.model.modules.action_model.fast_ActionHeader import get_action_model as get_fast_action_model
-from starVLA.model.modules.action_model.VLA_AdapterHeader import get_action_model as get_stage3_action_model
+from starVLA.model.modules.dino_model.dino import get_dino_model
+from starVLA.model.modules.projector.QFormer import LayerwiseQFormer
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.vlm.QWen3 import IMAGE_TOKEN_INDEX
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
+from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 logger = initialize_overwatch(__name__)
 
@@ -140,10 +150,9 @@ class TypedResidualFFN(nn.Module):
 
     TYPE_IDS = {"base": 0, "subtask": 1, "dynamic": 2, "spatial": 3, "action": 4}
 
-    def __init__(self, base_mlp: nn.Module) -> None:
+    def __init__(self, base_mlp: nn.Module, freeze_base_mlp: bool = True) -> None:
         super().__init__()
         self.base_mlp = base_mlp
-        self.base_mlp.requires_grad_(False)
 
         self.experts = nn.ModuleDict({
             "subtask": copy.deepcopy(base_mlp),
@@ -151,6 +160,8 @@ class TypedResidualFFN(nn.Module):
             "spatial": copy.deepcopy(base_mlp),
             "action": copy.deepcopy(base_mlp),
         })
+        self.base_mlp.requires_grad_(False)
+        self.experts.requires_grad_(True)
         self.token_type_ids: Optional[torch.Tensor] = None
 
     def set_token_type_ids(self, token_type_ids: Optional[torch.Tensor]) -> None:
@@ -300,6 +311,20 @@ class QwenMyVLA(baseframework):
     def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
         super().__init__()
         self.config = config
+        self.stage_name = str(getattr(self.config.trainer, "stage_name", "")).lower()
+        self._preloaded_from_checkpoint = False
+
+        lora_cfg = self.config.framework.get("lora", {})
+        self.enable_lora = bool(lora_cfg.get("enable", False))
+        default_lora_rank_by_stage = {"stage1": 4, "stage2": 8, "stage3": 4}
+        self.lora_rank = int(lora_cfg.get("rank", default_lora_rank_by_stage.get(self.stage_name, 8)))
+        self.lora_alpha = int(lora_cfg.get("alpha", min(self.lora_rank, 16)))
+        self.lora_dropout = float(lora_cfg.get("dropout", 0.0))
+        self.lora_target_modules = self._normalize_lora_value(lora_cfg.get("target_modules", "all-linear"))
+        self.lora_exclude_modules = self._normalize_lora_value(lora_cfg.get("exclude_modules", ["base_mlp"]))
+        self.lora_modules_to_save = self._normalize_lora_value(lora_cfg.get("modules_to_save", []))
+        self.lora_bias = str(lora_cfg.get("bias", "none"))
+        self.lora_init_weights = lora_cfg.get("init_lora_weights", "gaussian")
 
         required_fields = ["lam_stage2", "depth_encoder", "qwen3_embedding"]
         missing = [name for name in required_fields if not hasattr(self.config.framework, name)]
@@ -325,7 +350,15 @@ class QwenMyVLA(baseframework):
         k_sub = int(self.config.framework.get("slot_subtask", {}).get("num_slots", 4))
 
         dyn_in = int(self.config.framework.lam_stage2.get("latent_dim", 128))
-        spa_in = int(self.config.framework.depth_encoder.get("out_channels", [256, 512, 1024, 1024])[-1])
+        depth_cfg = self.config.framework.get("depth_encoder", {})
+        depth_out_channels = depth_cfg.get("out_channels", [256, 512, 1024, 1024])
+        if depth_out_channels is None:
+            depth_out_channels = []
+        depth_out_channels = list(depth_out_channels)
+        if len(depth_out_channels) > 0:
+            spa_in = int(depth_out_channels[-1])
+        else:
+            spa_in = int(depth_cfg.get("features", 1024))
         sub_in = int(self.subtask_slot_encoder.hidden_size)
 
         self.dynamic_projector = TokenAwareResampler(in_dim=dyn_in, out_dim=self.hidden_size, num_slots=k_dyn)
@@ -408,7 +441,18 @@ class QwenMyVLA(baseframework):
         self.fast_action_token_ids = self._resolve_fast_action_token_ids(tokenizer)
         self.image_token_id = IMAGE_TOKEN_INDEX
         self._moe_token_type_ids = None
-        self.stage_name = str(getattr(self.config.trainer, "stage_name", "")).lower()
+        progress_ctrl_cfg = self.config.framework.get("progress_control", {})
+        self.enable_progress_step_mapping = bool(progress_ctrl_cfg.get("enable_step_mapping", False))
+        self.enable_progress_window_mapping = bool(progress_ctrl_cfg.get("enable_window_mapping", False))
+        self.progress_step_start = int(progress_ctrl_cfg.get("step_start", 0))
+        self.progress_step_end = progress_ctrl_cfg.get("step_end", None)
+        if self.progress_step_end is not None:
+            self.progress_step_end = int(self.progress_step_end)
+        self.progress_step_windows = self._normalize_step_windows(progress_ctrl_cfg.get("step_windows", []))
+        self.progress_window_active_flags = self._normalize_window_flags(
+            progress_ctrl_cfg.get("window_active_flags", []),
+            expected_length=len(self.progress_step_windows),
+        )
         self.attention_visibility_rules = self._resolve_attention_visibility_rules()
         self.enable_back_half_typed_attention = bool(
             self.config.framework.get("attention_mask", {}).get("enable_apply", True)
@@ -467,12 +511,6 @@ class QwenMyVLA(baseframework):
             nn.GELU(),
             nn.Linear(self.hidden_size, self.num_actions_chunk * self.action_dim),
         )
-        self.coarse_action_state_proj = nn.Sequential(
-            nn.LayerNorm(self.action_dim),
-            nn.Linear(self.action_dim, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-        )
 
         continuous_cfg = self.config.framework.get("continuous_fm_loss", {})
         self.continuous_fm_loss_weight = float(continuous_cfg.get("weight", 1.0))
@@ -505,6 +543,15 @@ class QwenMyVLA(baseframework):
 
         stage3_cfg = self.config.framework.get("stage3_action_header", {})
         self.enable_stage3_action_header = bool(stage3_cfg.get("enable", False))
+        self.stage3_condition_model_type = str(stage3_cfg.get("model_type", "DiT-B"))
+        stage3_model_default_dims = {"DiT-S": 384, "DiT-B": 768, "DiT-L": 1024}
+        default_condition_hidden_dim = stage3_model_default_dims.get(self.stage3_condition_model_type, 768)
+        self.stage3_condition_hidden_dim = int(stage3_cfg.get("condition_hidden_dim", default_condition_hidden_dim))
+        self.stage3_condition_num_queries = int(stage3_cfg.get("condition_num_queries", 64))
+        self.stage3_condition_num_heads = int(
+            stage3_cfg.get("condition_num_heads", max(self.stage3_condition_hidden_dim // 64, 1))
+        )
+        self.stage3_dino_backbone = str(stage3_cfg.get("dino_backbone", "dinov2_vits14"))
         self.stage3_action_query_num = int(
             stage3_cfg.get(
                 "action_query_num",
@@ -512,10 +559,31 @@ class QwenMyVLA(baseframework):
             )
         )
         self.stage3_action_head = None
+        self.stage3_dino_encoder = None
+        self.stage3_dino_projector = None
+        self.stage3_condition_fuser = None
         if self.enable_stage3_action_header:
-            self.stage3_action_head = get_stage3_action_model(config=self.config)
-            if hasattr(self.stage3_action_head, "action_query_num"):
-                self.stage3_action_query_num = int(self.stage3_action_head.action_query_num)
+            self.stage3_dino_encoder = get_dino_model(backone_name=self.stage3_dino_backbone)
+            self.stage3_dino_encoder.eval()
+            for param in self.stage3_dino_encoder.parameters():
+                param.requires_grad = False
+
+            self.stage3_dino_projector = nn.Linear(self.stage3_dino_encoder.num_channels, self.hidden_size)
+            self.stage3_condition_fuser = LayerwiseQFormer(
+                input_hidden_dim=self.hidden_size,
+                output_hidden_dim=self.stage3_condition_hidden_dim,
+                num_query_tokens=self.stage3_condition_num_queries,
+                num_layers=self._resolve_qwen_num_hidden_states(),
+                num_heads=self.stage3_condition_num_heads,
+                config=self.config,
+            )
+            self.stage3_action_head = DiTActionModel(
+                action_hidden_dim=self.stage3_condition_hidden_dim,
+                model_type=self.stage3_condition_model_type,
+                in_channels=self.action_dim,
+                future_action_window_size=max(self.num_actions_chunk - 1, 0),
+                past_action_window_size=0,
+            )
 
         fast_cfg = self.config.framework.get("fast_action_loss", {})
         self.enable_fast_action_loss = bool(fast_cfg.get("enable", False))
@@ -526,6 +594,9 @@ class QwenMyVLA(baseframework):
         self.fast_action_model = None
         if self.enable_fast_action_loss:
             self.fast_action_model = get_fast_action_model(config=self.config)
+            self._configure_fast_action_tokenizer()
+
+        self._maybe_load_pretrained_and_attach_lora()
 
     def _attach_typed_ffn_moe(self) -> None:
         """Replace all Qwen FFN blocks with typed residual expert wrappers."""
@@ -543,7 +614,7 @@ class QwenMyVLA(baseframework):
                 raise AttributeError(f"Layer {layer_idx} does not have an mlp module.")
             if isinstance(layer.mlp, TypedResidualFFN):
                 continue
-            layer.mlp = TypedResidualFFN(layer.mlp)
+            layer.mlp = TypedResidualFFN(layer.mlp, freeze_base_mlp=True)
             self.moe_wrapped_layers.append(layer_idx)
 
             # Sanity check: each layer should own an independent expert module.
@@ -593,6 +664,166 @@ class QwenMyVLA(baseframework):
             layer = layers[layer_idx]
             if isinstance(layer.self_attn, BackHalfTypedSelfAttention):
                 layer.self_attn.set_typed_keep_mask(typed_keep_mask)
+
+    @staticmethod
+    def _load_state_dict_from_checkpoint(checkpoint_path: str | Path) -> Dict[str, torch.Tensor]:
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            checkpoint = checkpoint["state_dict"]
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Checkpoint `{checkpoint_path}` does not contain a state dict.")
+        return checkpoint
+
+    @staticmethod
+    def _state_dict_looks_like_lora(state_dict: Dict[str, torch.Tensor]) -> bool:
+        for key in state_dict.keys():
+            if "lora_A" in key or "lora_B" in key or "base_model.model" in key:
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_lora_value(value):
+        if hasattr(value, "_cfg"):
+            value = value._cfg
+        if OmegaConf.is_config(value):
+            value = OmegaConf.to_container(value, resolve=True)
+        return value
+
+    def _resolve_lora_modules_to_save(self) -> List[str]:
+        modules_to_save = self._normalize_lora_value(getattr(self, "lora_modules_to_save", []))
+        if modules_to_save is None:
+            return []
+        if isinstance(modules_to_save, str):
+            modules_to_save = [modules_to_save]
+        if not isinstance(modules_to_save, (list, tuple, set)):
+            raise TypeError(f"Unsupported framework.lora.modules_to_save type: {type(modules_to_save)!r}")
+        return [str(name) for name in modules_to_save if str(name)]
+
+    def _configure_fast_action_tokenizer(self) -> None:
+        if self.fast_action_model is None:
+            return
+        fast_tokenizer = getattr(self.fast_action_model, "fast_tokenizer", None)
+        if fast_tokenizer is None:
+            return
+
+        fast_tokenizer.time_horizon = self.num_actions_chunk
+        fast_tokenizer.action_dim = self.action_dim
+
+    @staticmethod
+    def _module_name_matches_exclude(module_name: str, exclude_name: str) -> bool:
+        if not exclude_name:
+            return False
+        if module_name == exclude_name:
+            return True
+        if module_name.startswith(f"{exclude_name}."):
+            return True
+        return exclude_name in module_name.split(".")
+
+    def _resolve_lora_target_module_names(self) -> List[str]:
+        root_model = getattr(self.qwen_vl_interface, "model", None)
+        if root_model is None:
+            raise AttributeError("Unable to resolve Qwen model for LoRA target discovery.")
+
+        target_modules_value = self._normalize_lora_value(getattr(self, "lora_target_modules", "all-linear"))
+        effective_exclude_modules = self._resolve_lora_exclude_module_names()
+        if isinstance(target_modules_value, (list, tuple, set)):
+            target_suffixes = [str(name) for name in target_modules_value if str(name)]
+            if not target_suffixes:
+                raise ValueError("framework.lora.target_modules is empty after normalization.")
+        elif isinstance(target_modules_value, str) and target_modules_value == "all-linear":
+            target_suffixes = None
+        elif isinstance(target_modules_value, str):
+            target_suffixes = [target_modules_value]
+        else:
+            raise TypeError(
+                f"Unsupported framework.lora.target_modules type: {type(target_modules_value)!r}"
+            )
+
+        target_module_names: List[str] = []
+        for module_name, module in root_model.named_modules():
+            if not module_name or not isinstance(module, nn.Linear):
+                continue
+            if any(self._module_name_matches_exclude(module_name, exclude_name) for exclude_name in effective_exclude_modules):
+                continue
+            if target_suffixes is None:
+                target_module_names.append(module_name)
+                continue
+
+            if any(module_name == suffix or module_name.endswith(f".{suffix}") for suffix in target_suffixes):
+                target_module_names.append(module_name)
+
+        if not target_module_names:
+            raise ValueError(
+                "No LoRA target modules were resolved. Check framework.lora.target_modules and exclude_modules."
+            )
+
+        return target_module_names
+
+    def _resolve_lora_exclude_module_names(self) -> List[str]:
+        exclude_modules = self._normalize_lora_value(getattr(self, "lora_exclude_modules", ["base_mlp"]))
+        if isinstance(exclude_modules, str):
+            exclude_modules = [exclude_modules]
+        exclude_modules = [str(name) for name in exclude_modules if str(name)]
+        default_excludes = ["base_mlp", "lm_head"]
+        for default_exclude in default_excludes:
+            if default_exclude not in exclude_modules:
+                exclude_modules.append(default_exclude)
+        return exclude_modules
+
+    def _attach_qwen_lora(self) -> None:
+        if not self.enable_lora:
+            return
+        if LoraConfig is None or get_peft_model is None:
+            raise ImportError("PEFT is required for LoRA training but is not installed.")
+
+        effective_exclude_modules = self._resolve_lora_exclude_module_names()
+        resolved_target_modules = self._resolve_lora_target_module_names()
+        modules_to_save = self._resolve_lora_modules_to_save()
+        logger.info(
+            "Resolved %d LoRA target modules for Qwen backbone (excluding %s)",
+            len(resolved_target_modules),
+            effective_exclude_modules,
+        )
+        if modules_to_save:
+            logger.info("LoRA modules_to_save for Qwen backbone: %s", modules_to_save)
+
+        lora_config = LoraConfig(
+            r=getattr(self, "lora_rank", 8),
+            lora_alpha=getattr(self, "lora_alpha", 8),
+            lora_dropout=getattr(self, "lora_dropout", 0.0),
+            target_modules=resolved_target_modules,
+            exclude_modules=effective_exclude_modules,
+            modules_to_save=modules_to_save or None,
+            bias=getattr(self, "lora_bias", "none"),
+            init_lora_weights=getattr(self, "lora_init_weights", "gaussian"),
+        )
+        self.qwen_vl_interface.model = get_peft_model(self.qwen_vl_interface.model, lora_config)
+        if hasattr(self.qwen_vl_interface.model, "print_trainable_parameters"):
+            self.qwen_vl_interface.model.print_trainable_parameters()
+
+    def _maybe_load_pretrained_and_attach_lora(self) -> None:
+        pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
+        if not self.enable_lora or not pretrained_checkpoint:
+            if self.enable_lora:
+                self._attach_qwen_lora()
+            return
+
+        checkpoint_path = Path(pretrained_checkpoint)
+        if not checkpoint_path.exists():
+            self._attach_qwen_lora()
+            return
+
+        state_dict = self._load_state_dict_from_checkpoint(checkpoint_path)
+        checkpoint_is_lora = self._state_dict_looks_like_lora(state_dict)
+
+        if checkpoint_is_lora:
+            self._attach_qwen_lora()
+            self.load_state_dict(state_dict, strict=False)
+        else:
+            self.load_state_dict(state_dict, strict=False)
+            self._attach_qwen_lora()
+
+        self._preloaded_from_checkpoint = True
 
     def _resolve_text_backbone_and_layers(self):
         """Resolve the text backbone module and its transformer layers across Qwen variants."""
@@ -710,12 +941,243 @@ class QwenMyVLA(baseframework):
         return float(start) + (float(end) - float(start)) * float(t)
 
     def _resolve_training_progress(self, kwargs: Dict) -> float:
+        return self._resolve_training_progress_info(kwargs)["progress"]
+
+    def _resolve_training_progress_info(self, kwargs: Dict) -> Dict[str, float | int | bool]:
         global_step = kwargs.get("global_step")
         max_train_steps = kwargs.get("max_train_steps")
         if global_step is None or max_train_steps is None:
-            return 0.0
+            return {
+                "progress": 0.0,
+                "global_step": 0,
+                "max_train_steps": 1,
+                "step_start": 0,
+                "step_end": 1,
+                "uses_step_mapping": False,
+                "uses_window_mapping": False,
+                "is_before_start": False,
+                "is_after_end": False,
+                "is_skipped": False,
+                "is_finished": False,
+                "current_window_index": -1,
+                "current_window_enabled": False,
+            }
+
+        global_step = int(global_step)
         max_train_steps = max(1, int(max_train_steps))
-        return max(0.0, min(1.0, float(global_step) / float(max_train_steps)))
+        if self.enable_progress_window_mapping and self.progress_step_windows:
+            windows = self.progress_step_windows
+            flags = self.progress_window_active_flags or [True] * len(windows)
+            active_windows = [(start, end) for (start, end), enabled in zip(windows, flags) if enabled]
+            if not active_windows:
+                return {
+                    "progress": 0.0,
+                    "global_step": global_step,
+                    "max_train_steps": max_train_steps,
+                    "step_start": windows[0][0],
+                    "step_end": windows[-1][1],
+                    "uses_step_mapping": False,
+                    "uses_window_mapping": True,
+                    "is_before_start": True,
+                    "is_after_end": False,
+                    "is_skipped": True,
+                    "is_finished": False,
+                    "current_window_index": -1,
+                    "current_window_enabled": False,
+                }
+
+            active_start = active_windows[0][0]
+            active_end = active_windows[-1][1]
+            active_total = float(sum(max(1, end - start) for start, end in active_windows))
+            if active_total <= 0:
+                active_total = 1.0
+
+            if global_step < active_start:
+                return {
+                    "progress": 0.0,
+                    "global_step": global_step,
+                    "max_train_steps": max_train_steps,
+                    "step_start": windows[0][0],
+                    "step_end": windows[-1][1],
+                    "uses_step_mapping": False,
+                    "uses_window_mapping": True,
+                    "is_before_start": True,
+                    "is_after_end": False,
+                    "is_skipped": True,
+                    "is_finished": False,
+                    "current_window_index": -1,
+                    "current_window_enabled": False,
+                }
+
+            accumulated = 0.0
+            for window_index, ((start, end), enabled) in enumerate(zip(windows, flags)):
+                window_length = max(1, end - start)
+                if not enabled:
+                    if start <= global_step < end:
+                        return {
+                            "progress": accumulated / active_total,
+                            "global_step": global_step,
+                            "max_train_steps": max_train_steps,
+                            "step_start": windows[0][0],
+                            "step_end": windows[-1][1],
+                            "uses_step_mapping": False,
+                            "uses_window_mapping": True,
+                            "is_before_start": False,
+                            "is_after_end": False,
+                            "is_skipped": True,
+                            "is_finished": False,
+                            "current_window_index": window_index,
+                            "current_window_enabled": False,
+                        }
+                    continue
+
+                if global_step < start:
+                    return {
+                        "progress": accumulated / active_total,
+                        "global_step": global_step,
+                        "max_train_steps": max_train_steps,
+                        "step_start": windows[0][0],
+                        "step_end": windows[-1][1],
+                        "uses_step_mapping": False,
+                        "uses_window_mapping": True,
+                        "is_before_start": False,
+                        "is_after_end": False,
+                        "is_skipped": True,
+                        "is_finished": False,
+                        "current_window_index": window_index,
+                        "current_window_enabled": True,
+                    }
+
+                if global_step < end:
+                    return {
+                        "progress": (accumulated + float(global_step - start)) / active_total,
+                        "global_step": global_step,
+                        "max_train_steps": max_train_steps,
+                        "step_start": windows[0][0],
+                        "step_end": windows[-1][1],
+                        "uses_step_mapping": False,
+                        "uses_window_mapping": True,
+                        "is_before_start": False,
+                        "is_after_end": False,
+                        "is_skipped": False,
+                        "is_finished": False,
+                        "current_window_index": window_index,
+                        "current_window_enabled": True,
+                    }
+
+                accumulated += float(window_length)
+
+            return {
+                "progress": 1.0,
+                "global_step": global_step,
+                "max_train_steps": max_train_steps,
+                "step_start": windows[0][0],
+                "step_end": windows[-1][1],
+                "uses_step_mapping": False,
+                "uses_window_mapping": True,
+                "is_before_start": False,
+                "is_after_end": True,
+                "is_skipped": False,
+                "is_finished": True,
+                "current_window_index": len(windows) - 1,
+                "current_window_enabled": flags[-1],
+            }
+
+        if self.enable_progress_step_mapping:
+            step_start = int(self.progress_step_start)
+            step_end = int(self.progress_step_end) if self.progress_step_end is not None else max_train_steps
+        else:
+            step_start = 0
+            step_end = max_train_steps
+
+        if step_end <= step_start:
+            step_end = step_start + 1
+
+        progress = max(0.0, min(1.0, float(global_step - step_start) / float(step_end - step_start)))
+        return {
+            "progress": float(progress),
+            "global_step": global_step,
+            "max_train_steps": max_train_steps,
+            "step_start": step_start,
+            "step_end": step_end,
+            "uses_step_mapping": bool(self.enable_progress_step_mapping),
+            "uses_window_mapping": False,
+            "is_before_start": bool(global_step < step_start),
+            "is_after_end": bool(global_step >= step_end),
+            "is_skipped": bool(global_step < step_start),
+            "is_finished": bool(global_step >= step_end),
+            "current_window_index": -1,
+            "current_window_enabled": False,
+        }
+
+    @staticmethod
+    def _normalize_step_windows(step_windows) -> List[List[int]]:
+        if not step_windows:
+            return []
+
+        normalized = []
+        for window in step_windows:
+            if isinstance(window, (str, bytes)):
+                raise ValueError(f"progress_control.step_windows must be a list of [start, end] pairs, got: {window}")
+            try:
+                start, end = window[0], window[1]
+            except Exception as exc:
+                raise ValueError(
+                    f"progress_control.step_windows must be a list of [start, end] pairs, got: {window}"
+                ) from exc
+
+            try:
+                if len(window) != 2:
+                    raise ValueError
+            except Exception as exc:
+                raise ValueError(
+                    f"progress_control.step_windows must be a list of [start, end] pairs, got: {window}"
+                ) from exc
+
+            start, end = int(start), int(end)
+            if end <= start:
+                raise ValueError(f"Invalid progress window [{start}, {end}]; end must be greater than start")
+            normalized.append([start, end])
+        return normalized
+
+    @staticmethod
+    def _normalize_window_flags(window_flags, expected_length: int) -> List[bool]:
+        if expected_length <= 0:
+            return []
+        if not window_flags:
+            return [True] * expected_length
+
+        flags = [bool(flag) for flag in window_flags]
+        if len(flags) != expected_length:
+            raise ValueError(
+                f"progress_control.window_active_flags length {len(flags)} does not match step_windows length {expected_length}"
+            )
+        return flags
+
+    @staticmethod
+    def _resolve_schedule_flags(progress: float, start: float, end: float, enable: bool) -> Dict[str, float | bool]:
+        if not enable:
+            return {"enable": False, "skipped": True, "finished": False, "t": 0.0}
+
+        if end <= start:
+            finished = progress >= end
+            return {
+                "enable": True,
+                "skipped": bool(progress < start),
+                "finished": bool(finished),
+                "t": 1.0 if finished else 0.0,
+            }
+
+        if progress < start:
+            return {"enable": True, "skipped": True, "finished": False, "t": 0.0}
+        if progress >= end:
+            return {"enable": True, "skipped": False, "finished": True, "t": 1.0}
+        return {
+            "enable": True,
+            "skipped": False,
+            "finished": False,
+            "t": max(0.0, min(1.0, float((progress - start) / (end - start)))),
+        }
 
     def _resolve_slot_mask_hparams(self, progress: float) -> tuple[Dict[str, float], List[float]]:
         if not self.enable_slot_mask_curriculum:
@@ -879,6 +1341,66 @@ class QwenMyVLA(baseframework):
             "positions": positions,
             "mask": positions.ge(0),
         }
+
+    @staticmethod
+    def _concat_valid_positions(*position_tensors: Optional[torch.Tensor]) -> torch.Tensor:
+        valid_tensors = [positions for positions in position_tensors if positions is not None]
+        if not valid_tensors:
+            raise ValueError("No position tensors provided for concatenation.")
+
+        first = valid_tensors[0]
+        if first.ndim != 2:
+            raise ValueError(f"Position tensor must be [B, N], got {tuple(first.shape)}")
+
+        batch_size = first.shape[0]
+        device = first.device
+        merged_rows: List[torch.Tensor] = []
+        max_len = 0
+
+        for batch_idx in range(batch_size):
+            pieces = []
+            for positions in valid_tensors:
+                if positions.ndim != 2:
+                    raise ValueError(f"Position tensor must be [B, N], got {tuple(positions.shape)}")
+                row = positions[batch_idx]
+                row = row[row.ge(0)]
+                if row.numel() > 0:
+                    pieces.append(row)
+
+            merged = torch.cat(pieces, dim=0) if pieces else torch.empty((0,), dtype=torch.long, device=device)
+            merged_rows.append(merged)
+            max_len = max(max_len, int(merged.numel()))
+
+        merged_positions = torch.full((batch_size, max_len), -1, dtype=torch.long, device=device)
+        for batch_idx, row in enumerate(merged_rows):
+            if row.numel() > 0:
+                merged_positions[batch_idx, : row.numel()] = row
+        return merged_positions
+
+    def _resolve_qwen_num_hidden_states(self) -> int:
+        root_model = getattr(self.qwen_vl_interface, "model", None)
+        if root_model is None:
+            raise AttributeError("Unable to resolve Qwen model from qwen_vl_interface.")
+
+        candidate_configs = [
+            getattr(getattr(root_model, "config", None), "text_config", None),
+            getattr(root_model, "config", None),
+            getattr(getattr(root_model, "model", None), "config", None),
+            getattr(getattr(getattr(root_model, "model", None), "config", None), "text_config", None),
+        ]
+        for candidate in candidate_configs:
+            if candidate is None:
+                continue
+            num_hidden_layers = getattr(candidate, "num_hidden_layers", None)
+            if num_hidden_layers is not None:
+                return int(num_hidden_layers) + 1
+
+        text_model = getattr(root_model, "model", None)
+        layers = getattr(text_model, "layers", None)
+        if layers is not None:
+            return len(layers) + 1
+
+        raise AttributeError("Unable to resolve the number of Qwen hidden states for Stage-3 fusion.")
 
     def _build_sequence_layout_pre_injection(
         self,
@@ -1090,6 +1612,47 @@ class QwenMyVLA(baseframework):
         return token_type_ids
 
     @staticmethod
+    def _compute_supervised_fast_token_metrics(
+        logits: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+    ) -> Dict[str, float]:
+        """Compute token-level FAST supervision stats aligned with causal LM loss.
+
+        Assumes `labels` already contain only FAST action-token supervision and
+        all non-action/template positions are IGNORE_INDEX.
+        """
+        if logits is None or labels is None:
+            return {
+                "fast_label_token_count": 0.0,
+                "fast_token_correct": 0.0,
+                "fast_token_accuracy": 0.0,
+            }
+
+        if logits.ndim != 3 or labels.ndim != 2:
+            raise ValueError(
+                f"Expected logits [B, L, V] and labels [B, L], got {tuple(logits.shape)} and {tuple(labels.shape)}"
+            )
+
+        shift_logits = logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        valid_mask = shift_labels.ne(-100)
+        valid_count = int(valid_mask.sum().item())
+        if valid_count == 0:
+            return {
+                "fast_label_token_count": 0.0,
+                "fast_token_correct": 0.0,
+                "fast_token_accuracy": 0.0,
+            }
+
+        predictions = shift_logits.argmax(dim=-1)
+        correct = int(((predictions == shift_labels) & valid_mask).sum().item())
+        return {
+            "fast_label_token_count": float(valid_count),
+            "fast_token_correct": float(correct),
+            "fast_token_accuracy": float(correct / valid_count),
+        }
+
+    @staticmethod
     def _gather_slot_hidden(last_hidden: torch.Tensor, slot_positions: torch.Tensor) -> torch.Tensor:
         """Gather slot hidden states from [B, L, H] with slot positions [B, K]."""
         if last_hidden.ndim != 3:
@@ -1186,14 +1749,13 @@ class QwenMyVLA(baseframework):
         predicted_actions: torch.Tensor,
         gt_actions: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute continuous branch loss with optional flow matching objective.
+        """Compute loss for the light continuous branch.
 
-        objective=l1:
-            plain supervised L1 on predicted x1.
-        objective=fm:
-            conditional flow matching in action space, supervising velocity:
-                x_t = (1-t) * x0 + t * x1,   u_t = x1 - x0
-            We use model predicted x1_hat to form u_hat = x1_hat - x0.
+        Important:
+            This branch does not condition on sampled x_t or timestep t, so it
+            cannot implement true flow matching. We therefore use direct
+            supervised regression on x1 and reserve actual FM for the Stage-3
+            DiT action head.
         """
         objective = self.continuous_fm_objective
         if objective == "l1":
@@ -1202,22 +1764,10 @@ class QwenMyVLA(baseframework):
         if objective != "fm":
             raise ValueError(f"Unsupported continuous_fm_loss.objective: {objective}")
 
-        x1 = gt_actions
-        x0 = torch.randn_like(x1) * self.continuous_fm_noise_scale
-
-        batch = x1.shape[0]
-        t = torch.rand((batch, 1, 1), device=x1.device, dtype=x1.dtype)
-        if self.continuous_fm_t_eps > 0:
-            t = t.clamp(min=self.continuous_fm_t_eps, max=1.0 - self.continuous_fm_t_eps)
-
-        _xt = (1.0 - t) * x0 + t * x1
-        target_u = x1 - x0
-        pred_u = predicted_actions - x0
-
         if self.continuous_fm_loss_type == "l1":
-            return F.l1_loss(pred_u, target_u)
+            return F.l1_loss(predicted_actions, gt_actions)
         if self.continuous_fm_loss_type == "mse":
-            return F.mse_loss(pred_u, target_u)
+            return F.mse_loss(predicted_actions, gt_actions)
         raise ValueError(f"Unsupported continuous_fm_loss.loss_type: {self.continuous_fm_loss_type}")
 
     def _build_stage3_action_positions(self, dyn_pos: torch.Tensor, spa_pos: torch.Tensor, sub_pos: torch.Tensor) -> torch.Tensor:
@@ -1284,20 +1834,141 @@ class QwenMyVLA(baseframework):
 
         return torch.cat(all_layers, dim=1), vision_hidden_len
 
-    def _build_stage3_coarse_condition(
+    def _build_stage3_m1_condition(
         self,
-        qwen_last_hidden: torch.Tensor,
-        action_pos: Optional[torch.Tensor],
-        predicted_actions_light: torch.Tensor,
+        hidden_states: List[torch.Tensor],
+        batch_images: List,
+        sequence_layout_pre_injection: Dict[str, Dict[str, torch.Tensor]],
+        action_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Preferred source: hidden states at action-token positions (coarse discrete path).
-        if action_pos is not None and action_pos.numel() > 0:
-            action_hidden = self._gather_slot_hidden(qwen_last_hidden, action_pos)
-            return action_hidden.mean(dim=1)
+        if self.stage3_condition_fuser is None or self.stage3_dino_encoder is None or self.stage3_dino_projector is None:
+            raise RuntimeError("Stage-3 M1 condition builder is not initialized.")
 
-        # Fallback source: project light coarse action chunks into hidden space.
-        projected = self.coarse_action_state_proj(predicted_actions_light)
-        return projected.mean(dim=1)
+        if len(hidden_states) < self.stage3_condition_fuser.num_layers:
+            raise ValueError(
+                f"Qwen hidden state count {len(hidden_states)} is smaller than the stage-3 fusion depth "
+                f"{self.stage3_condition_fuser.num_layers}."
+            )
+
+        hidden_states = hidden_states[-self.stage3_condition_fuser.num_layers :]
+        text_positions = sequence_layout_pre_injection["text"]["positions"]
+        sub_positions = sequence_layout_pre_injection["subtask"]["positions"]
+        dyn_positions = sequence_layout_pre_injection["dynamic"]["positions"]
+        spa_positions = sequence_layout_pre_injection["spatial"]["positions"]
+        merged_positions = self._concat_valid_positions(text_positions, sub_positions, dyn_positions, spa_positions, action_pos)
+
+        valid_mask = merged_positions.ge(0)
+        gather_positions = merged_positions.clamp_min(0)
+        batch_size = gather_positions.shape[0]
+        device = gather_positions.device
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(gather_positions)
+
+        with torch.no_grad():
+            dino_inputs = self.stage3_dino_encoder.prepare_dino_input(batch_images)
+            dino_tokens = self.stage3_dino_encoder(dino_inputs)
+
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
+        with autocast_ctx:
+            dino_tokens = self.stage3_dino_projector(dino_tokens.to(device=device, dtype=hidden_states[0].dtype))
+            if dino_tokens.shape[0] != batch_size:
+                if dino_tokens.shape[0] % batch_size != 0:
+                    raise ValueError(
+                        f"Stage-3 DINO token batch size {dino_tokens.shape[0]} is not divisible by qwen batch size {batch_size}."
+                    )
+                num_views = dino_tokens.shape[0] // batch_size
+                dino_tokens = dino_tokens.reshape(batch_size, num_views * dino_tokens.shape[1], dino_tokens.shape[2])
+            dino_mask = torch.zeros((batch_size, dino_tokens.shape[1]), dtype=torch.bool, device=device)
+
+            fused_layers = []
+            for layer_hidden in hidden_states:
+                layer_hidden = layer_hidden.to(device=device, dtype=dino_tokens.dtype)
+                qwen_tokens = layer_hidden[batch_indices, gather_positions, :]
+                if (~valid_mask).any():
+                    qwen_tokens = qwen_tokens.masked_fill((~valid_mask).unsqueeze(-1), 0.0)
+                fused_layers.append(torch.cat([qwen_tokens, dino_tokens], dim=1))
+
+            fused_attention_mask = torch.cat([~valid_mask, dino_mask], dim=1)
+            return self.stage3_condition_fuser(fused_layers, encoder_attention_mask=fused_attention_mask)
+
+    def _sample_stage3_actions(
+        self,
+        stage3_condition: torch.Tensor,
+        cfg_scale: float = 1.5,
+        use_ddim: bool = True,
+        num_ddim_steps: int = 5,
+    ) -> torch.Tensor:
+        if self.stage3_action_head is None:
+            raise RuntimeError("Stage-3 action head is not initialized.")
+
+        batch_size = stage3_condition.shape[0]
+        device = stage3_condition.device
+        model_dtype = next(self.stage3_action_head.net.parameters()).dtype
+        stage3_condition = stage3_condition.to(device=device, dtype=model_dtype)
+        if hasattr(self.stage3_action_head, "sample_actions"):
+            sample_steps = int(num_ddim_steps) if use_ddim and num_ddim_steps is not None else 10
+            return self.stage3_action_head.sample_actions(
+                condition=stage3_condition,
+                cfg_scale=cfg_scale,
+                num_steps=sample_steps,
+            )
+        action_horizon = getattr(self.stage3_action_head, "action_horizon", None)
+        if action_horizon is None:
+            future_window = int(
+                getattr(self.stage3_action_head, "future_action_window_size", self.num_actions_chunk - 1)
+            )
+            past_window = int(getattr(self.stage3_action_head, "past_action_window_size", 0))
+            action_horizon = future_window + past_window + 1
+        action_horizon = int(action_horizon)
+        if action_horizon <= 0:
+            raise ValueError(f"Invalid stage-3 action horizon: {action_horizon}")
+
+        noise = torch.randn(
+            batch_size,
+            action_horizon,
+            self.stage3_action_head.in_channels,
+            device=device,
+        ).to(model_dtype)
+
+        using_cfg = cfg_scale > 1.0
+        if using_cfg:
+            noise = torch.cat([noise, noise], dim=0)
+            uncondition = self.stage3_action_head.net.z_embedder.uncondition.to(device=device, dtype=model_dtype)
+            uncondition_shape = uncondition.shape
+            uncondition = uncondition.unsqueeze(0).expand(batch_size, uncondition_shape[0], uncondition_shape[1])
+            z = torch.cat([stage3_condition, uncondition], dim=0)
+            model_kwargs = dict(z=z, cfg_scale=cfg_scale)
+            sample_fn = self.stage3_action_head.net.forward_with_cfg
+        else:
+            model_kwargs = dict(z=stage3_condition)
+            sample_fn = self.stage3_action_head.net.forward
+
+        if use_ddim and num_ddim_steps is not None:
+            if self.stage3_action_head.ddim_diffusion is None:
+                self.stage3_action_head.create_ddim(ddim_step=num_ddim_steps)
+            samples = self.stage3_action_head.ddim_diffusion.ddim_sample_loop(
+                sample_fn,
+                noise.shape,
+                noise,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                progress=False,
+                device=device,
+                eta=0.0,
+            )
+        else:
+            samples = self.stage3_action_head.diffusion.p_sample_loop(
+                sample_fn,
+                noise.shape,
+                noise,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                progress=False,
+                device=device,
+            )
+
+        if using_cfg:
+            samples, _ = samples.chunk(2, dim=0)
+        return samples
 
     @staticmethod
     def _map_fast_token_to_vlm_action(tokens: List[int]) -> str:
@@ -1458,7 +2129,9 @@ class QwenMyVLA(baseframework):
 
         batch_images = [example["image"] for example in examples]
         instructions = [example.get("lang", example.get("instruction", "")) for example in examples]
-        training_progress = self._resolve_training_progress(kwargs)
+        actions = [example["action"] for example in examples]
+        progress_info = self._resolve_training_progress_info(kwargs)
+        training_progress = float(progress_info["progress"])
 
         lam_outputs = self.dynamic_teacher_encoder(examples=examples)
         depth_outputs = self.spatial_teacher_encoder(examples=examples)
@@ -1498,7 +2171,25 @@ class QwenMyVLA(baseframework):
         suffix = self._slot_prompt_suffix()
         instructions = [text + suffix for text in instructions]
 
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        use_fast_supervision = self.enable_fast_action_loss and self.training
+        vlm_action_tokens = None
+        if use_fast_supervision:
+            if self.fast_action_model is None:
+                raise RuntimeError(
+                    "fast_action_loss is enabled but fast_action_model is not initialized."
+                )
+            if not all("action" in sample and sample["action"] is not None for sample in examples):
+                raise RuntimeError(
+                    "fast_action_loss is enabled during training but batch examples do not contain GT `action`."
+                )
+            actions = [sample["action"] for sample in examples]
+            batch_fast_tokens = self.fast_action_model.encoder_action2fastoken(actions)
+            vlm_action_tokens = [self._map_fast_token_to_vlm_action(fast_tokens) for fast_tokens in batch_fast_tokens]
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+            solutions=vlm_action_tokens if use_fast_supervision else None,
+        )
         input_ids = qwen_inputs["input_ids"]
 
         dyn_pos = self._gather_positions(input_ids, self.dynamic_token_id, self.k_dyn)
@@ -1513,6 +2204,14 @@ class QwenMyVLA(baseframework):
             action_pos = self._gather_positions(input_ids, action_token_id, num_action_tokens)
             action_mask = torch.zeros_like(input_ids, dtype=torch.bool)
             action_mask.scatter_(1, action_pos, True)
+        fast_action_token_type_ids = None
+        if use_fast_supervision:
+            fast_action_token_type_ids = self._build_fast_action_token_type_ids(input_ids)
+            fast_action_mask = fast_action_token_type_ids.eq(TypedResidualFFN.TYPE_IDS["action"])
+            if action_mask is None:
+                action_mask = fast_action_mask
+            else:
+                action_mask = action_mask | fast_action_mask
         sequence_layout_pre_injection = self._build_sequence_layout_pre_injection(
             input_ids=input_ids,
             dyn_pos=dyn_pos,
@@ -1527,6 +2226,9 @@ class QwenMyVLA(baseframework):
             sub_pos=sub_pos,
             action_pos=action_pos,
         )
+        if fast_action_token_type_ids is not None:
+            fast_action_mask = fast_action_token_type_ids.eq(TypedResidualFFN.TYPE_IDS["action"])
+            token_type_ids[fast_action_mask] = TypedResidualFFN.TYPE_IDS["action"]
         self_attention_mask = self._build_self_attention_mask(sequence_layout_pre_injection=sequence_layout_pre_injection)
 
         batch_size = input_ids.shape[0]
@@ -1599,8 +2301,7 @@ class QwenMyVLA(baseframework):
             subtask_fused=qwen_subtask_slot_fused,
         )
 
-        predicted_actions_stage3 = None
-        stage3_coarse_condition = None
+        stage3_condition = None
         if self.enable_stage3_action_header:
             if self.stage3_action_head is None:
                 raise RuntimeError("stage3_action_head is not initialized while stage3_action_header is enabled.")
@@ -1611,25 +2312,14 @@ class QwenMyVLA(baseframework):
                 sub_pos=sub_pos,
                 action_pos=action_pos,
             )
-            stage3_hidden, stage3_vision_len = self._build_stage3_multilayer_hidden(
+            stage3_condition = self._build_stage3_m1_condition(
                 hidden_states=list(qwen_outputs.hidden_states),
-                image_positions=sequence_layout_pre_injection["image"]["positions"],
-                action_positions=stage3_action_pos,
-            )
-            self.stage3_action_head = self.stage3_action_head.to(device=stage3_hidden.device, dtype=stage3_hidden.dtype)
-            stage3_coarse_condition = self._build_stage3_coarse_condition(
-                qwen_last_hidden=qwen_last_hidden,
-                action_pos=action_pos,
-                predicted_actions_light=predicted_actions_light,
-            )
-            predicted_actions_stage3 = self.stage3_action_head.predict_action(
-                stage3_hidden,
-                vision_hidden_len=stage3_vision_len,
-                state_projected=stage3_coarse_condition,
-                phase="Training" if self.training else "Inference",
+                batch_images=batch_images,
+                sequence_layout_pre_injection=sequence_layout_pre_injection,
+                action_pos=stage3_action_pos,
             )
 
-        predicted_actions = predicted_actions_stage3 if predicted_actions_stage3 is not None else predicted_actions_light
+        predicted_actions = predicted_actions_light
 
         gt_actions = self._extract_gt_actions(
             examples=examples,
@@ -1643,18 +2333,32 @@ class QwenMyVLA(baseframework):
                     "Please check framework.action_model.action_dim and dataset action dimension."
                 )
 
-            if gt_actions.shape[1] != predicted_actions.shape[1]:
-                target_len = min(gt_actions.shape[1], predicted_actions.shape[1])
-                logger.warning(
-                    "Action chunk length mismatch detected (gt=%d, pred=%d). Truncating both to %d for L1 loss.",
-                    gt_actions.shape[1],
-                    predicted_actions.shape[1],
-                    target_len,
+            if self.enable_stage3_action_header and stage3_condition is not None:
+                repeated_diffusion_steps = (
+                    self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
                 )
-                gt_actions = gt_actions[:, :target_len, :]
-                predicted_actions = predicted_actions[:, :target_len, :]
+                action_head_dtype = next(self.stage3_action_head.net.parameters()).dtype
+                stage3_condition_repeated = stage3_condition.to(device=gt_actions.device, dtype=action_head_dtype).repeat(
+                    repeated_diffusion_steps, 1, 1
+                )
+                gt_actions_repeated = gt_actions.to(device=gt_actions.device, dtype=action_head_dtype).repeat(
+                    repeated_diffusion_steps, 1, 1
+                )
+                noise_pred, noise, timestep = self.stage3_action_head(gt_actions_repeated, stage3_condition_repeated)
+                continuous_fm_loss = self.stage3_action_head.loss(noise_pred, noise)
+            else:
+                if gt_actions.shape[1] != predicted_actions.shape[1]:
+                    target_len = min(gt_actions.shape[1], predicted_actions.shape[1])
+                    logger.warning(
+                        "Action chunk length mismatch detected (gt=%d, pred=%d). Truncating both to %d for L1 loss.",
+                        gt_actions.shape[1],
+                        predicted_actions.shape[1],
+                        target_len,
+                    )
+                    gt_actions = gt_actions[:, :target_len, :]
+                    predicted_actions = predicted_actions[:, :target_len, :]
 
-            continuous_fm_loss = self._compute_continuous_fm_loss(predicted_actions, gt_actions)
+                continuous_fm_loss = self._compute_continuous_fm_loss(predicted_actions, gt_actions)
         else:
             continuous_fm_loss = torch.zeros((), device=loss_device, dtype=torch.float32)
 
@@ -1689,16 +2393,23 @@ class QwenMyVLA(baseframework):
             align_subtask = {"mse": zero, "cos": zero, "total": zero}
             slot_align_loss = zero
 
-        if self.enable_fast_action_loss:
-            fast_action_loss = self._compute_fast_action_loss(
-                examples=examples,
-                batch_images=batch_images,
-                instructions=instructions,
-            )
+        if use_fast_supervision:
+            fast_action_loss = qwen_outputs.loss
+            if fast_action_loss is None or torch.isnan(fast_action_loss):
+                fast_action_loss = torch.zeros((), device=loss_device, dtype=torch.float32)
             fast_action_loss_for_optim = fast_action_loss.detach() if self.fast_action_loss_detach else fast_action_loss
+            fast_token_metrics = self._compute_supervised_fast_token_metrics(
+                logits=getattr(qwen_outputs, "logits", None),
+                labels=qwen_inputs.get("labels"),
+            )
         else:
             fast_action_loss = torch.zeros((), device=loss_device, dtype=torch.float32)
             fast_action_loss_for_optim = fast_action_loss
+            fast_token_metrics = {
+                "fast_label_token_count": 0.0,
+                "fast_token_correct": 0.0,
+                "fast_token_accuracy": 0.0,
+            }
 
         continuous_fm_loss_for_optim = (
             continuous_fm_loss.detach() if self.continuous_fm_loss_detach else continuous_fm_loss
@@ -1731,14 +2442,15 @@ class QwenMyVLA(baseframework):
             "fast_action_loss": fast_action_loss.detach(),
             "fast_action_loss_for_optim": fast_action_loss_for_optim.detach(),
             "fast_action_loss_detach": self.fast_action_loss_detach,
+            "fast_label_token_count": fast_token_metrics["fast_label_token_count"],
+            "fast_token_correct": fast_token_metrics["fast_token_correct"],
+            "fast_token_accuracy": fast_token_metrics["fast_token_accuracy"],
             "predicted_actions": predicted_actions,
             "predicted_actions_light": predicted_actions_light.detach(),
-            "predicted_actions_stage3": (
-                predicted_actions_stage3.detach() if predicted_actions_stage3 is not None else None
-            ),
             "stage3_coarse_condition": (
-                stage3_coarse_condition.detach() if stage3_coarse_condition is not None else None
+                stage3_condition.mean(dim=1).detach() if stage3_condition is not None else None
             ),
+            "stage3_condition": stage3_condition.detach() if stage3_condition is not None else None,
             "use_stage3_action_header": self.enable_stage3_action_header,
             "lam_indices": lam_outputs["indices"],
             "lam_z_q": lam_outputs["z_q"],
@@ -1760,6 +2472,27 @@ class QwenMyVLA(baseframework):
                 "subtask": keep_subtask,
             },
             "training_progress": training_progress,
+            "training_progress_state": {
+                "uses_step_mapping": bool(progress_info["uses_step_mapping"]),
+                "global_step": int(progress_info["global_step"]),
+                "max_train_steps": int(progress_info["max_train_steps"]),
+                "step_start": int(progress_info["step_start"]),
+                "step_end": int(progress_info["step_end"]),
+                "is_before_start": bool(progress_info["is_before_start"]),
+                "is_after_end": bool(progress_info["is_after_end"]),
+            },
+            "slot_mask_curriculum_state": self._resolve_schedule_flags(
+                progress=training_progress,
+                start=float(self.slot_mask_curriculum_progress_start),
+                end=float(self.slot_mask_curriculum_progress_end),
+                enable=bool(self.enable_slot_mask_curriculum and use_mask),
+            ),
+            "loss_weight_schedule_state": self._resolve_schedule_flags(
+                progress=training_progress,
+                start=float(self.loss_weight_schedule_progress_start),
+                end=float(self.loss_weight_schedule_progress_end),
+                enable=bool(self.enable_loss_weight_schedule),
+            ),
             "slot_mask_hparams": {
                 "inner": {
                     "dynamic": float(inner_mask_ratios_cur["dynamic"]),
@@ -1814,13 +2547,462 @@ class QwenMyVLA(baseframework):
         return outputs
 
     @torch.inference_mode()
+    def generate_with_action_routing(
+        self,
+        examples: List[dict],
+        max_new_tokens: int = 100,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        do_sample: bool = False,
+        skip_teacher_slots: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Autoregressively generate action tokens with dynamic action-type routing."""
+        if not self.enable_fast_action_loss or self.fast_action_model is None:
+            raise RuntimeError(
+                "generate_with_action_routing requires fast_action_loss enabled and fast_action_model initialized."
+            )
+
+        batch_size = len(examples)
+        batch_images = [example["image"] for example in examples]
+        instructions = [example.get("lang", example.get("instruction", "")) for example in examples]
+
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if train_obs_image_size:
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        suffix = self._slot_prompt_suffix()
+        instructions = [text + suffix for text in instructions]
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+            solutions=None,
+        )
+        input_ids = qwen_inputs["input_ids"]
+
+        dyn_pos = self._gather_positions(input_ids, self.dynamic_token_id, self.k_dyn)
+        spa_pos = self._gather_positions(input_ids, self.spatial_token_id, self.k_spa)
+        sub_pos = self._gather_positions(input_ids, self.subtask_token_id, self.k_sub)
+        enable_action_tokens = bool(getattr(self, "enable_action_tokens", False))
+        num_action_tokens = int(getattr(self, "num_action_tokens", 0))
+        action_token_id = getattr(self, "action_token_id", None)
+        action_pos = None
+        action_mask = None
+        if enable_action_tokens and action_token_id is not None and num_action_tokens > 0:
+            action_pos = self._gather_positions(input_ids, action_token_id, num_action_tokens)
+            action_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            action_mask.scatter_(1, action_pos, True)
+
+        sequence_layout_pre_injection = self._build_sequence_layout_pre_injection(
+            input_ids=input_ids,
+            dyn_pos=dyn_pos,
+            spa_pos=spa_pos,
+            sub_pos=sub_pos,
+            action_mask=action_mask,
+        )
+        token_type_ids = self._build_token_type_ids(
+            input_ids,
+            dyn_pos=dyn_pos,
+            spa_pos=spa_pos,
+            sub_pos=sub_pos,
+            action_pos=action_pos,
+        )
+        if skip_teacher_slots:
+            slot_device = input_ids.device
+            dynamic_slots = torch.zeros((batch_size, self.k_dyn, self.hidden_size), device=slot_device)
+            spatial_slots = torch.zeros((batch_size, self.k_spa, self.hidden_size), device=slot_device)
+            subtask_slots = torch.zeros((batch_size, self.k_sub, self.hidden_size), device=slot_device)
+            keep_dynamic = torch.zeros((batch_size, self.k_dyn), dtype=torch.bool, device=slot_device)
+            keep_spatial = torch.zeros((batch_size, self.k_spa), dtype=torch.bool, device=slot_device)
+            keep_subtask = torch.zeros((batch_size, self.k_sub), dtype=torch.bool, device=slot_device)
+        else:
+            dynamic_slots = self._build_dynamic_slots(self.dynamic_teacher_encoder(examples=examples))
+            spatial_slots = self._build_spatial_slots(self.spatial_teacher_encoder(examples=examples))
+            subtask_slots = self._build_subtask_slots(self.subtask_slot_encoder(examples=examples))
+
+            if self.enable_slot_mask and self.slot_mask_apply_in_eval:
+                masked = self._apply_slot_masks(
+                    dynamic_slots,
+                    spatial_slots,
+                    subtask_slots,
+                    inner_mask_ratios=self.inner_mask_ratios,
+                    outside_num_masked_probs=self.outside_num_masked_probs,
+                )
+                dynamic_slots = masked["dynamic_slots"]
+                spatial_slots = masked["spatial_slots"]
+                subtask_slots = masked["subtask_slots"]
+                keep_dynamic = masked["keep_dynamic"]
+                keep_spatial = masked["keep_spatial"]
+                keep_subtask = masked["keep_subtask"]
+            else:
+                keep_dynamic = torch.ones((dynamic_slots.shape[0], self.k_dyn), dtype=torch.bool, device=dynamic_slots.device)
+                keep_spatial = torch.ones((spatial_slots.shape[0], self.k_spa), dtype=torch.bool, device=spatial_slots.device)
+                keep_subtask = torch.ones((subtask_slots.shape[0], self.k_sub), dtype=torch.bool, device=subtask_slots.device)
+
+        current_input_ids = input_ids.clone()
+        current_attention_mask = qwen_inputs["attention_mask"].clone() if "attention_mask" in qwen_inputs else torch.ones_like(input_ids)
+        current_token_type_ids = token_type_ids.clone()
+        generated_token_ids = []
+
+        action_token_ids_tensor = None
+        if self.fast_action_token_ids:
+            action_token_ids_tensor = torch.tensor(
+                sorted(self.fast_action_token_ids),
+                device=current_input_ids.device,
+                dtype=current_input_ids.dtype,
+            )
+        action_started = torch.zeros((batch_size,), dtype=torch.bool, device=current_input_ids.device)
+        action_finished = torch.zeros((batch_size,), dtype=torch.bool, device=current_input_ids.device)
+
+        def inject_slot_hook(_module, _inputs, output):
+            batch_idx_dyn = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, self.k_dyn)
+            batch_idx_spa = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, self.k_spa)
+            batch_idx_sub = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, self.k_sub)
+            batch_idx_act = None
+            if action_pos is not None:
+                batch_idx_act = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, action_pos.shape[1])
+
+            dyn_keep = keep_dynamic.to(device=output.device)
+            spa_keep = keep_spatial.to(device=output.device)
+            sub_keep = keep_subtask.to(device=output.device)
+
+            dyn_slots_cast = dynamic_slots.to(device=output.device, dtype=output.dtype)
+            spa_slots_cast = spatial_slots.to(device=output.device, dtype=output.dtype)
+            sub_slots_cast = subtask_slots.to(device=output.device, dtype=output.dtype)
+
+            if dyn_keep.any():
+                output[batch_idx_dyn[dyn_keep], dyn_pos[dyn_keep], :] = dyn_slots_cast[dyn_keep]
+            if spa_keep.any():
+                output[batch_idx_spa[spa_keep], spa_pos[spa_keep], :] = spa_slots_cast[spa_keep]
+            if sub_keep.any():
+                output[batch_idx_sub[sub_keep], sub_pos[sub_keep], :] = sub_slots_cast[sub_keep]
+
+            action_token_queries = getattr(self, "action_token_queries", None)
+            if action_pos is not None and action_token_queries is not None:
+                action_queries = action_token_queries.to(device=output.device, dtype=output.dtype)
+                action_queries = action_queries.unsqueeze(0).expand(batch_size, -1, -1)
+                output[batch_idx_act, action_pos, :] = action_queries
+            return output
+
+        embedding_layer = self._resolve_input_embeddings_layer()
+        hook_handle = embedding_layer.register_forward_hook(inject_slot_hook)
+        try:
+            for _ in range(max_new_tokens):
+                self._set_typed_ffn_token_type_ids(current_token_type_ids)
+                if self.enable_back_half_typed_attention:
+                    current_action_mask = current_token_type_ids.eq(TypedResidualFFN.TYPE_IDS["action"])
+                    current_layout = self._build_sequence_layout_pre_injection(
+                        input_ids=current_input_ids,
+                        dyn_pos=dyn_pos,
+                        spa_pos=spa_pos,
+                        sub_pos=sub_pos,
+                        action_mask=current_action_mask,
+                    )
+                    current_self_attention_mask = self._build_self_attention_mask(current_layout)
+                    self._set_back_half_typed_attention_mask(current_self_attention_mask)
+                model_inputs = dict(qwen_inputs)
+                model_inputs["input_ids"] = current_input_ids
+                model_inputs["attention_mask"] = current_attention_mask
+                outputs = self.qwen_vl_interface(
+                    **model_inputs,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+
+                logits = outputs.logits[:, -1, :]
+                if action_token_ids_tensor is not None:
+                    allowed_mask = torch.zeros_like(logits, dtype=torch.bool)
+                    allowed_mask[:, action_token_ids_tensor] = True
+                    logits = logits.masked_fill(~allowed_mask, float("-inf"))
+                logits = logits / max(temperature, 1e-6)
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+                cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+                nucleus_mask = cumsum_probs > top_p
+                nucleus_mask[..., 0] = False
+                sorted_probs[nucleus_mask] = 0
+                sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+
+                if do_sample:
+                    next_token_idx = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
+                    next_token_id = sorted_indices.gather(-1, next_token_idx.unsqueeze(-1)).squeeze(-1)
+                else:
+                    next_token_id = logits.argmax(dim=-1)
+                generated_token_ids.append(next_token_id.detach().cpu())
+
+                current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(-1)], dim=-1)
+                current_attention_mask = torch.cat(
+                    [
+                        current_attention_mask,
+                        torch.ones((batch_size, 1), dtype=current_attention_mask.dtype, device=current_attention_mask.device),
+                    ],
+                    dim=-1,
+                )
+
+                new_token_type = torch.zeros(
+                    (batch_size, 1),
+                    dtype=current_token_type_ids.dtype,
+                    device=current_token_type_ids.device,
+                )
+                if action_token_ids_tensor is not None:
+                    is_action = (next_token_id.unsqueeze(-1) == action_token_ids_tensor.view(1, -1)).any(dim=-1)
+                    new_token_type[is_action] = TypedResidualFFN.TYPE_IDS["action"]
+                    action_finished = action_finished | (action_started & (~is_action))
+                    action_started = action_started | is_action
+
+                current_token_type_ids = torch.cat([current_token_type_ids, new_token_type], dim=-1)
+                if bool(action_finished.all()):
+                    break
+        finally:
+            hook_handle.remove()
+            self._set_typed_ffn_token_type_ids(None)
+            if self.enable_back_half_typed_attention:
+                self._set_back_half_typed_attention_mask(None)
+
+        return {
+            "input_ids": current_input_ids,
+            "generated_token_ids": (
+                torch.stack(generated_token_ids, dim=-1)
+                if generated_token_ids
+                else torch.empty((batch_size, 0), dtype=torch.long)
+            ),
+            "token_type_ids": current_token_type_ids,
+        }
+
+    def _extract_action_token_ids(
+        self,
+        generated_ids: torch.LongTensor,
+    ) -> List[List[int]]:
+        act_min = self.qwen_vl_interface._ACTION_TOKEN_MIN
+        act_max = self.qwen_vl_interface._ACTION_TOKEN_MAX
+        results = []
+        for batch_idx in range(generated_ids.size(0)):
+            seq = generated_ids[batch_idx]
+            is_action = (seq >= act_min) & (seq <= act_max)
+            idx = is_action.nonzero(as_tuple=False).flatten()
+            if idx.numel() == 0:
+                results.append([])
+                continue
+            start = int(idx[0].item())
+            end = start
+            seq_len = seq.shape[0]
+            while end < seq_len and bool(is_action[end]):
+                end += 1
+            results.append(seq[start:end].tolist())
+        return results
+
+    def _decode_action_tokens(self, batch_vlm_tokens: List[List[int]]) -> List[List[int] | None]:
+        act_min = self.qwen_vl_interface._ACTION_TOKEN_MIN
+        batch_fast_token_ids = []
+        for seq in batch_vlm_tokens:
+            if not seq:
+                batch_fast_token_ids.append(None)
+                continue
+            batch_fast_token_ids.append([token_id - act_min for token_id in seq])
+        return batch_fast_token_ids
+
+    def _trim_fast_token_prefixes_to_valid_actions(
+        self,
+        batch_fast_token_ids: List[List[int] | None],
+    ) -> List[List[int] | None]:
+        processor = self.fast_action_model.fast_tokenizer
+        bpe_tokenizer = processor.bpe_tokenizer
+        target_chars = int(self.num_actions_chunk) * int(self.action_dim)
+
+        trimmed_batch = []
+        for seq in batch_fast_token_ids:
+            if not seq:
+                trimmed_batch.append(None)
+                continue
+
+            valid_prefix = None
+            for end in range(1, len(seq) + 1):
+                decoded_text = bpe_tokenizer.decode(seq[:end])
+                char_count = len(decoded_text)
+                if char_count == target_chars:
+                    valid_prefix = seq[:end]
+                    break
+                if char_count > target_chars:
+                    break
+
+            trimmed_batch.append(valid_prefix)
+
+        return trimmed_batch
+
+    @torch.inference_mode()
     def predict_action(self, examples: List[dict] = None, **kwargs):
         if examples is None:
             raise ValueError("QwenMyVLA.predict_action expects examples: List[dict]")
 
-        outputs = self.forward(examples=examples)
+        if not self.enable_stage3_action_header:
+            if kwargs.get("fast_inference", False):
+                generated = self.generate_with_action_routing(
+                    examples=examples,
+                    max_new_tokens=int(kwargs.get("max_new_tokens", 128)),
+                    temperature=float(kwargs.get("temperature", 0.7)),
+                    top_p=float(kwargs.get("top_p", 0.9)),
+                    do_sample=bool(kwargs.get("do_sample", False)),
+                    skip_teacher_slots=bool(kwargs.get("skip_teacher_slots", True)),
+                )
+                batch_vlm_action_token_ids = self._extract_action_token_ids(generated["generated_token_ids"].to(self.qwen_vl_interface.model.device))
+                batch_fast_action_token_idx = self._decode_action_tokens(batch_vlm_action_token_ids)
+                batch_fast_action_token_idx = self._trim_fast_token_prefixes_to_valid_actions(batch_fast_action_token_idx)
+                if any(seq is None for seq in batch_fast_action_token_idx):
+                    raise RuntimeError(
+                        "FAST inference did not produce a valid token prefix that decodes to "
+                        f"({self.num_actions_chunk}, {self.action_dim}) actions."
+                    )
+                normalized_actions = self.fast_action_model.fast_tokenizer.decode(batch_fast_action_token_idx)
+                return {
+                    "normalized_actions": normalized_actions,
+                    "generated_token_ids": generated["generated_token_ids"].numpy(),
+                }
+            outputs = self.forward(examples=examples)
+            return {
+                "normalized_actions": outputs["predicted_actions"].detach().cpu().numpy(),
+            }
+
+        batch_images = [example["image"] for example in examples]
+        instructions = [example.get("lang", example.get("instruction", "")) for example in examples]
+
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if train_obs_image_size:
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+        instructions = [text + self._slot_prompt_suffix() for text in instructions]
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        input_ids = qwen_inputs["input_ids"]
+
+        dyn_pos = self._gather_positions(input_ids, self.dynamic_token_id, self.k_dyn)
+        spa_pos = self._gather_positions(input_ids, self.spatial_token_id, self.k_spa)
+        sub_pos = self._gather_positions(input_ids, self.subtask_token_id, self.k_sub)
+        enable_action_tokens = bool(getattr(self, "enable_action_tokens", False))
+        num_action_tokens = int(getattr(self, "num_action_tokens", 0))
+        action_token_id = getattr(self, "action_token_id", None)
+        action_pos = None
+        action_mask = None
+        if enable_action_tokens and action_token_id is not None and num_action_tokens > 0:
+            action_pos = self._gather_positions(input_ids, action_token_id, num_action_tokens)
+            action_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            action_mask.scatter_(1, action_pos, True)
+
+        sequence_layout_pre_injection = self._build_sequence_layout_pre_injection(
+            input_ids=input_ids,
+            dyn_pos=dyn_pos,
+            spa_pos=spa_pos,
+            sub_pos=sub_pos,
+            action_mask=action_mask,
+        )
+        token_type_ids = self._build_token_type_ids(
+            input_ids,
+            dyn_pos=dyn_pos,
+            spa_pos=spa_pos,
+            sub_pos=sub_pos,
+            action_pos=action_pos,
+        )
+        self_attention_mask = self._build_self_attention_mask(sequence_layout_pre_injection=sequence_layout_pre_injection)
+
+        batch_size = input_ids.shape[0]
+
+        self._set_typed_ffn_token_type_ids(token_type_ids)
+        if self.enable_back_half_typed_attention:
+            self._set_back_half_typed_attention_mask(self_attention_mask)
+
+        dynamic_slots = self._build_dynamic_slots(self.dynamic_teacher_encoder(examples=examples))
+        spatial_slots = self._build_spatial_slots(self.spatial_teacher_encoder(examples=examples))
+        subtask_slots = self._build_subtask_slots(self.subtask_slot_encoder(examples=examples))
+
+        if self.enable_stage3_action_header and self.enable_slot_mask:
+            masked = self._apply_slot_masks(
+                dynamic_slots,
+                spatial_slots,
+                subtask_slots,
+                inner_mask_ratios=self.inner_mask_ratios,
+                outside_num_masked_probs=self.outside_num_masked_probs,
+            )
+            dynamic_slots = masked["dynamic_slots"]
+            spatial_slots = masked["spatial_slots"]
+            subtask_slots = masked["subtask_slots"]
+            keep_dynamic = masked["keep_dynamic"]
+            keep_spatial = masked["keep_spatial"]
+            keep_subtask = masked["keep_subtask"]
+        else:
+            keep_dynamic = torch.ones((dynamic_slots.shape[0], self.k_dyn), dtype=torch.bool, device=dynamic_slots.device)
+            keep_spatial = torch.ones((spatial_slots.shape[0], self.k_spa), dtype=torch.bool, device=spatial_slots.device)
+            keep_subtask = torch.ones((subtask_slots.shape[0], self.k_sub), dtype=torch.bool, device=subtask_slots.device)
+
+        def inject_slot_hook(_module, _inputs, output):
+            batch_idx_dyn = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, self.k_dyn)
+            batch_idx_spa = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, self.k_spa)
+            batch_idx_sub = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, self.k_sub)
+            batch_idx_act = None
+            if action_pos is not None:
+                batch_idx_act = torch.arange(batch_size, device=output.device).unsqueeze(1).expand(-1, action_pos.shape[1])
+
+            dyn_keep = keep_dynamic.to(device=output.device)
+            spa_keep = keep_spatial.to(device=output.device)
+            sub_keep = keep_subtask.to(device=output.device)
+
+            dyn_slots_cast = dynamic_slots.to(device=output.device, dtype=output.dtype)
+            spa_slots_cast = spatial_slots.to(device=output.device, dtype=output.dtype)
+            sub_slots_cast = subtask_slots.to(device=output.device, dtype=output.dtype)
+
+            if dyn_keep.any():
+                output[batch_idx_dyn[dyn_keep], dyn_pos[dyn_keep], :] = dyn_slots_cast[dyn_keep]
+            if spa_keep.any():
+                output[batch_idx_spa[spa_keep], spa_pos[spa_keep], :] = spa_slots_cast[spa_keep]
+            if sub_keep.any():
+                output[batch_idx_sub[sub_keep], sub_pos[sub_keep], :] = sub_slots_cast[sub_keep]
+
+            action_token_queries = getattr(self, "action_token_queries", None)
+            if action_pos is not None and action_token_queries is not None:
+                action_queries = action_token_queries.to(device=output.device, dtype=output.dtype)
+                action_queries = action_queries.unsqueeze(0).expand(batch_size, -1, -1)
+                output[batch_idx_act, action_pos, :] = action_queries
+            return output
+
+        embedding_layer = self._resolve_input_embeddings_layer()
+        hook_handle = embedding_layer.register_forward_hook(inject_slot_hook)
+        try:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+            with autocast_ctx:
+                qwen_outputs = self.qwen_vl_interface(
+                    **qwen_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+        finally:
+            hook_handle.remove()
+            self._set_typed_ffn_token_type_ids(None)
+            if self.enable_back_half_typed_attention:
+                self._set_back_half_typed_attention_mask(None)
+
+        stage3_action_pos = self._build_stage3_action_positions_with_optional_action_tokens(
+            dyn_pos=dyn_pos,
+            spa_pos=spa_pos,
+            sub_pos=sub_pos,
+            action_pos=action_pos,
+        )
+        stage3_condition = self._build_stage3_m1_condition(
+            hidden_states=list(qwen_outputs.hidden_states),
+            batch_images=batch_images,
+            sequence_layout_pre_injection=sequence_layout_pre_injection,
+            action_pos=stage3_action_pos,
+        )
+
+        cfg_scale = float(kwargs.get("cfg_scale", 1.5))
+        use_ddim = bool(kwargs.get("use_ddim", True))
+        num_ddim_steps = kwargs.get("num_ddim_steps", 5)
+        normalized_actions = self._sample_stage3_actions(
+            stage3_condition=stage3_condition,
+            cfg_scale=cfg_scale,
+            use_ddim=use_ddim,
+            num_ddim_steps=num_ddim_steps,
+        )
+
         return {
-            "normalized_actions": outputs["predicted_actions"].detach().cpu().numpy(),
+            "normalized_actions": normalized_actions.detach().cpu().numpy(),
         }
 
 if __name__ == "__main__":

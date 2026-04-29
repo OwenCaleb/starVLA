@@ -1,11 +1,11 @@
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
-export LIBERO_HOME=/home/liwenbo/projects/environment/LIBERO  # Root directory of the LIBERO project
-export LIBERO_python=/home/liwenbo/anaconda3/envs/starVLA/bin/python  # Path to the Python environment
-export starVLA_python=/home/liwenbo/anaconda3/envs/starVLA/bin/python  # Path to the Python environment
+export LIBERO_HOME=/mnt/nas_ssd/workspace/wenboli/projects/LIBERO  # Root directory of the LIBERO project
+export LIBERO_python=/opt/conda/envs/starVLA/bin/python  # Path to the Python environment
+export starVLA_python=/opt/conda/envs/starVLA/bin/python # Path to the Python environment
 
 # === End of environment variable configuration ===
-export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero  # Path to LIBERO configuration files
+export LIBERO_CONFIG_PATH=${LIBERO_HOME}  # Path to LIBERO configuration files
 export PYTHONPATH=$PYTHONPATH:${LIBERO_HOME} # let eval_libero find the LIBERO tools
 export PYTHONPATH=$(pwd):${PYTHONPATH} # let LIBERO find the websocket tools from starVLA repo
 ###########################################################################################
@@ -21,10 +21,10 @@ run_index=$3
 # run_index=8
 ##### === variables for which evaluation to setup ===
 
-num_gpus=8
+num_gpus=1
 gpu_id=$((run_index % num_gpus))
 
-num_trials_per_task=50
+num_trials_per_task=10
 host="127.0.0.1"
 base_port=$((6450 + run_index))
 unnorm_key="franka"

@@ -230,4 +230,10 @@ results/
 
 Depth-Anything-V2/
 UniVLA/
-flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whlPaperTool/
+/PaperTool/
+
+# local generated outputs
+/DAV2exp/output/
+/exp/video/
+/exp/output/

@@ -2,8 +2,8 @@
 
 echo `which python`
 
-export sim_python=/home/liwenbo/anaconda3/envs/starVLA/bin/python
-export SimplerEnv_PATH=/home/liwenbo/projects/environment/SimplerEnv
+export sim_python=/opt/conda/envs/starVLA/bin/python
+export SimplerEnv_PATH=/mnt/nas_ssd/workspace/wenboli/projects/SimplerEnv
 export PYTHONPATH=$(pwd):${PYTHONPATH}
 #### set environment variables #####
 
@@ -11,7 +11,7 @@ export PYTHONPATH=$(pwd):${PYTHONPATH}
 if [ -n "$1" ]; then
   MODEL_PATH="$1" # model path indict the output tree
 else
-  MODEL_PATH=/home/liwenbo/projects/VLA/starVLA/playground/Pretrained_models/Qwen3VL-GR00T-Bridge-RT-1/checkpoints/steps_20000_pytorch_model.pt
+  MODEL_PATH=/mnt/nas_ssd/workspace/wenboli/projects/starVLA/playground/Pretrained_models/Qwen-FAST-Bridge-RT-1/checkpoints/steps_10000_pytorch_model.pt
 fi
 
 port=${2:-6678} # connect to your policy server port
@@ -33,7 +33,7 @@ mkdir -p "${output_eval_dir}"
 TSET_NUM=1
 # export DEBUG=1
 
-: "${CUDA_VISIBLE_DEVICES:=7}"
+: "${CUDA_VISIBLE_DEVICES:=0}"
 export CUDA_VISIBLE_DEVICES
 
 IFS=',' read -r -a CUDA_DEVICES <<< "$CUDA_VISIBLE_DEVICES"

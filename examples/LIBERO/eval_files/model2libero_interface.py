@@ -28,6 +28,7 @@ class ModelClient:
         image_size: list[int] = [224, 224],
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
+        fast_inference: bool = False,
         adaptive_ensemble_alpha = 0.1,
         host="0.0.0.0",
         port=10095,
@@ -41,6 +42,7 @@ class ModelClient:
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
+        self.fast_inference = fast_inference
         self.image_size = image_size
         self.horizon = horizon #0
         self.action_ensemble = action_ensemble
@@ -61,6 +63,7 @@ class ModelClient:
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        self.fast_execute_steps = 1
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -99,27 +102,40 @@ class ModelClient:
         if example is not None:
             if task_description != self.task_description:
                 self.reset(task_description)
-                
+
         images = [self._resize_image(image) for image in images]
         example["image"] = images
+        for temporal_key in ("video", "videos", "temporal_video", "temporal_frames", "lam_video"):
+            if temporal_key in example and example[temporal_key] is not None:
+                example[temporal_key] = [self._resize_image(frame) for frame in example[temporal_key]]
         vla_input = {
             "examples": [example],
             "do_sample": False,
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
+            "fast_inference": self.fast_inference,
         }
         
 
         action_chunk_size = self.action_chunk_size
+        if self.fast_inference:
+            action_chunk_size = self.fast_execute_steps
         if step % action_chunk_size == 0:
             response = self.client.predict_action(vla_input)
+            if not response.get("ok", True):
+                error = response.get("error", {})
+                raise RuntimeError(f"Policy server inference failed: {error.get('message', response)}")
             try:
                 normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
             except KeyError:
                 print(f"Response data: {response}")
-                raise KeyError(f"Key 'normalized_actions' not found in response data: {response['data'].keys()}")
+                raise KeyError(f"Key 'normalized_actions' not found in response data: {response.get('data', {}).keys()}")
             
-            normalized_actions = normalized_actions[0]    
+            normalized_actions = normalized_actions[0]
+            if self.fast_inference:
+                if normalized_actions.shape[0] == 0:
+                    raise RuntimeError("FAST inference returned an empty decoded action chunk.")
+                normalized_actions = normalized_actions[: self.fast_execute_steps]
             self.raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
         
         raw_actions = self.raw_actions[step % action_chunk_size][None]    
@@ -160,8 +176,15 @@ class ModelClient:
     @staticmethod
     def get_action_chunk_size(policy_ckpt_path):
         model_config, _ = read_mode_config(policy_ckpt_path)  # read config and norm_stats
-        # import ipdb; ipdb.set_trace()
-        return model_config['framework']['action_model']['future_action_window_size'] + 1
+        action_cfg = model_config["framework"]["action_model"]
+        if "num_actions_chunk" in action_cfg:
+            return int(action_cfg["num_actions_chunk"])
+        if "future_action_window_size" in action_cfg:
+            return int(action_cfg["future_action_window_size"]) + 1
+        raise KeyError(
+            "Cannot determine action chunk size from checkpoint config. "
+            "Expected framework.action_model.num_actions_chunk or future_action_window_size."
+        )
 
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:

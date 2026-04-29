@@ -161,32 +161,33 @@ class _QWen3_VL_Interface(nn.Module):
         messages,
         tokenize=True,
         padding=True,
-        add_generation_prompt=True,
+        add_generation_prompt=(solutions is None),
         return_dict=True,
         return_tensors="pt"
         )
 
         # if solutions, mask out the solution tokens in labels
-        if solutions is not None: #  here only for fast_tokenizer now. 
+        if solutions is not None: #  here only for fast_tokenizer now.
             action_token_min = _ACTION_TOKEN_MIN # how can we know this range? --> we has other way for this, but is slower see qwenhelix branch
             action_token_max = _ACTION_TOKEN_MAX # here only for fast_tokenizer, see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md
-            labels = batch_inputs['input_ids'].clone()
-            # For each sequence in the batch, find the first occurrence of an action token.
+            input_ids = batch_inputs["input_ids"]
+            labels = torch.full_like(input_ids, IGNORE_INDEX)
+            # Only supervise FAST action tokens themselves. Do not include
+            # trailing assistant template / EOS tokens in the CE target.
             for i in range(labels.size(0)):
-                seq = labels[i]
-                # Create a mask for tokens within the action token range.
+                seq = input_ids[i]
                 mask_seq = (seq >= action_token_min) & (seq <= action_token_max)
                 nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
                 if nonzero_indices.numel() > 0:
-                    first_action_index = nonzero_indices[0].item()
-                    # Mask out all tokens before the first action token.
-                    seq[:first_action_index] = IGNORE_INDEX
+                    labels[i, mask_seq] = seq[mask_seq]
                 else:
-                    # If no action token is found, mask the entire sequence.
-                    seq[:] = IGNORE_INDEX
-                    RuntimeWarning (f"action token are on in yout tokenizer, plz see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md.")
-            
-            labels[labels == self.processor.tokenizer.pad_token_id] = -100 ## mask out pad tokens as well
+                    raise RuntimeError(
+                        "No FAST action token found in Qwen labels. "
+                        "Check that Qwen special action tokens were added correctly; "
+                        "see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md."
+                    )
+
+            labels[labels == self.processor.tokenizer.pad_token_id] = IGNORE_INDEX
             batch_inputs['labels'] = labels
 
         return batch_inputs.to(self.model.device)

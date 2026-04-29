@@ -1,13 +1,13 @@
 
-cd /home/liwenbo/projects/VLA/starVLA
+cd /mnt/nas_ssd/workspace/wenboli/projects/starVLA
 export PYTHONPATH=$(pwd):${PYTHONPATH}
 
 port=6678
-gpu_id=4
+gpu_id=0
 # export DEBUG=true
-export star_vla_python=/home/liwenbo/anaconda3/envs/starVLA/bin/python
+export star_vla_python=/opt/conda/envs/starVLA/bin/python
 
-your_ckpt=/home/liwenbo/projects/VLA/starVLA/playground/Pretrained_models/Qwen3VL-GR00T-Bridge-RT-1/checkpoints/steps_20000_pytorch_model.pt
+your_ckpt=/mnt/nas_ssd/workspace/wenboli/projects/starVLA/playground/Pretrained_models/Qwen-FAST-Bridge-RT-1/checkpoints/steps_10000_pytorch_model.pt
 
 #### build output directory #####
 ckpt_dir=$(dirname "${your_ckpt}")

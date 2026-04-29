@@ -1,8 +1,10 @@
 #!/bin/bash
 
-cd /home/liwenbo/projects/VLA/starVLA
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+cd "$REPO_ROOT"
 SCRIPT_PATH="./examples/LIBERO/eval_files/auto_eval_scripts/eval_libero_parall.sh"
-your_ckpt=/home/liwenbo/projects/VLA/starVLA/playground/Pretrained_models/StarVLA_Qwen2.5_VL/checkpoints/steps_30000_pytorch_model.pt
+your_ckpt=/mnt/nas_ssd/workspace/wenboli/projects/starVLA/playground/Pretrained_models/Qwen3-VL-OFT-LIBERO-4in1/checkpoints/steps_50000_pytorch_model.pt
 run_index_base=346
 
 #####################################################

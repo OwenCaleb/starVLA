@@ -235,9 +235,36 @@ class ModelClient:
         """
         policy_ckpt_path = Path(policy_ckpt_path)
         model_config, norm_stats = read_mode_config(policy_ckpt_path)  # read config and norm_stats
-
-        # unnorm_key = baseframework._check_unnorm_key(norm_stats, unnorm_key) # 其实也是很环境 specific 的
+        unnorm_key = ModelClient._check_unnorm_key(norm_stats, unnorm_key)
         return norm_stats[unnorm_key]["action"]
+
+    @staticmethod
+    def _check_unnorm_key(norm_stats, unnorm_key):
+        """Resolve the dataset statistics key used for action unnormalization."""
+        if unnorm_key is None:
+            if len(norm_stats) == 1:
+                return next(iter(norm_stats.keys()))
+            raise ValueError(
+                f"Multiple dataset statistics are available, please pass an explicit unnorm_key: {list(norm_stats.keys())}"
+            )
+
+        if unnorm_key in norm_stats:
+            return unnorm_key
+
+        alias_map = {
+            "oxe_bridge": "bridge_dataset",
+            "oxe_rt1": "rt1_dataset",
+        }
+        aliased_key = alias_map.get(unnorm_key)
+        if aliased_key is not None and aliased_key in norm_stats:
+            return aliased_key
+
+        if len(norm_stats) == 1:
+            return next(iter(norm_stats.keys()))
+
+        raise KeyError(
+            f"The requested unnorm_key `{unnorm_key}` is not in the available statistics: {list(norm_stats.keys())}"
+        )
 
 
 

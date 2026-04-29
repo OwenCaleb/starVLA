@@ -393,6 +393,10 @@ Stage II 的总损失为：
 
 Stage III 的目标是：在保留 FAST action 训练的同时，引入 continuous action generation。我们将 Stage II 产生的 coarse discrete action 作为条件输入，通过 DiT-based flow matching 生成最终 continuous action chunk。
 
+Stage III 的输入 slot 固定为 full-mask，和 Stage II 的终态一致：三类 teacher encoders 继续冻结并生成 target，但注入到 VLM 的 slot token 全部保持 masked 状态，slot alignment 也采用 masked-target 语义。
+
+
+
 ---
 
 ### Continuous action head

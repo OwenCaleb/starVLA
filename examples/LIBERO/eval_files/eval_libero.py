@@ -11,12 +11,24 @@ import time
 
 import imageio
 import numpy as np
+import torch
 import tqdm
 import tyro
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.LIBERO.eval_files.model2libero_interface import ModelClient
+
+
+_ORIGINAL_TORCH_LOAD = torch.load
+
+
+def _torch_load_compat(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _ORIGINAL_TORCH_LOAD(*args, **kwargs)
+
+
+torch.load = _torch_load_compat
 
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
@@ -51,6 +63,7 @@ class Args:
     pretrained_path: str = ""
 
     post_process_action: bool = True
+    fast_inference: bool = False
 
     job_name: str = "test"
 
@@ -89,6 +102,7 @@ def eval_libero(args: Args) -> None:
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
+        fast_inference=args.fast_inference,
     )
 
 
@@ -294,6 +308,6 @@ def start_debugpy_once():
     start_debugpy_once._started = True
 
 if __name__ == "__main__":
-    if os.getenv("DEBUG", False):
+    if os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
         start_debugpy_once()
     tyro.cli(eval_libero)

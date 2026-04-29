@@ -2,15 +2,15 @@ run_id: myvla_stage1
 run_root_dir: results/Checkpoints
 seed: 42
 trackers: [jsonl, wandb]
-wandb_entity: your_wandb_entity
-wandb_project: starVLA
+wandb_entity: a1962672280-south-china-university-of-technology
+wandb_project: ICL-VLA
 is_debug: false
 
 framework:
   name: QwenMyVLA
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action
-    attn_implementation: eager
+    attn_implementation: sdpa
     vl_hidden_dim: 2560
 
   lam_stage2:
@@ -44,7 +44,7 @@ framework:
   slot_dynamic:
     num_slots: 4
   slot_spatial:
-    num_slots: 16
+    num_slots: 8
   slot_subtask:
     num_slots: 4
 
@@ -76,6 +76,15 @@ framework:
     enable: false
     weight: 0.0
     detach: false
+
+  lora:
+    enable: true
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    exclude_modules: [base_mlp]
+    bias: none
 
   action_model:
     hidden_dim: 2560
@@ -123,59 +132,59 @@ framework:
       text:
         text: true
         image: true
-        subtask: true
-        dynamic: true
-        spatial: true
+        subtask: false
+        dynamic: false
+        spatial: false
       image:
-        text: true
+        text: false
         image: true
         subtask: false
         dynamic: false
-        spatial: true
+        spatial: false
       subtask:
         text: true
-        image: false
+        image: true
         subtask: true
         dynamic: false
         spatial: false
       dynamic:
         text: true
-        image: false
-        subtask: false
+        image: true
+        subtask: true
         dynamic: true
         spatial: false
       spatial:
-        text: false
+        text: true
         image: true
-        subtask: false
-        dynamic: false
+        subtask: true
+        dynamic: true
         spatial: true
     stage_visibility:
       stage1:
         text:
           text: true
           image: true
-          subtask: true
-          dynamic: true
-          spatial: true
+          subtask: false
+          dynamic: false
+          spatial: false
           action: false
         image:
-          text: true
+          text: false
           image: true
           subtask: false
           dynamic: false
-          spatial: true
+          spatial: false
           action: false
         subtask:
           text: true
-          image: false
+          image: true
           subtask: true
           dynamic: false
           spatial: false
           action: false
         dynamic:
           text: true
-          image: false
+          image: true
           subtask: false
           dynamic: true
           spatial: false
@@ -202,28 +211,26 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
-    data_mix: libero_all
+    data_mix: libero_spatial
     action_type: delta_qpos
-    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
-    CoT_answer: bbox
-    default_image_resolution: [3, 224, 224]
+    default_image_resolution: [3, 112, 112]
     per_device_batch_size: 8
     load_all_data_for_training: true
-    obs: ["video.primary_image"]
     temporal_video_delta_indices: [0, 19]
-    image_size: [224, 224]
+    obs: ["image_0"]
+    image_size: [112, 112]
     video_backend: torchvision_av
 
 trainer:
   stage_name: stage1
   epochs: 100
-  max_train_steps: 1000000
-  num_warmup_steps: 5000
+  max_train_steps: 20000
+  num_warmup_steps: 1000
   save_interval: 5000
   eval_interval: 100
   learning_rate:
     base: 1.0e-05
-    qwen_vl_interface: 1.0e-05
+    qwen_vl_interface: 5.0e-05
     dynamic_teacher_encoder: 1.0e-05
     spatial_teacher_encoder: 1.0e-05
     subtask_slot_encoder: 1.0e-05
@@ -235,7 +242,7 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-07
-  freeze_modules: 'param_regex:\.self_attn\.,param_regex:\.mlp\.experts\.action\.,qwen_vl_interface.model.lm_head,fast_action_model,action_predictor,coarse_action_state_proj,param_regex:^action_token_queries$'
+  freeze_modules: 'param_regex:\.self_attn\.,param_regex:\.mlp\.experts\.action\.,qwen_vl_interface.model.lm_head,fast_action_model,action_predictor,param_regex:^action_token_queries$'
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0

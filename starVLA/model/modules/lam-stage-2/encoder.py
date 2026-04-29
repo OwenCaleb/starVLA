@@ -152,12 +152,65 @@ class UniVLALAMStage2Encoder(nn.Module):
             dropout=0.0,
         )
         self._load_checkpoint(ckpt_path)
+        self._disable_code_restart()
 
         if freeze:
             self.model.requires_grad_(False)
             self.model.eval()
 
         self.image_to_tensor = transforms.ToTensor()
+
+    def _disable_code_restart(self) -> None:
+        """Prevent UniVLA VQ usage bookkeeping from running on GPU indices.
+
+        The vendor VectorQuantizer keeps a CPU buffer for code usage counts.
+        During multi-GPU training, its `update_usage()` path receives CUDA
+        indices and crashes unless `code_restart` is disabled.
+        """
+        for module in self.model.modules():
+            if hasattr(module, "code_restart"):
+                module.code_restart = False
+
+    def _set_vq_modules_training(self, enabled: bool):
+        """Temporarily override VQ module training flags.
+
+        UniVLA's VectorQuantizer calls `update_usage()` whenever the module is
+        not in training mode, even if `code_restart` has been disabled. We keep
+        the frozen teacher in eval mode overall, but flip only the VQ submodules
+        to train mode for the forward pass so the usage bookkeeping stays off.
+        """
+        states = []
+        for module in self.model.modules():
+            if hasattr(module, "code_restart"):
+                states.append((module, module.training))
+                module.train(enabled)
+        return states
+
+    def _restore_vq_modules_training(self, states):
+        for module, training in states:
+            module.train(training)
+
+    def _get_encoder_runtime_dtype(self) -> torch.dtype:
+        """Pick a stable compute dtype for LAM encoder inputs.
+
+        Prefer LayerNorm parameter dtype in the UniVLA encoder path because
+        the runtime failure occurs there when input/parameter dtypes diverge.
+        Fall back to the first floating parameter dtype.
+        """
+        # 1) Prefer LayerNorm dtype inside the actual encoder stack.
+        encoder = getattr(self.model, "encoder", None)
+        if encoder is not None:
+            for module in encoder.modules():
+                if isinstance(module, nn.LayerNorm) and module.weight is not None:
+                    return module.weight.dtype
+
+        # 2) Generic fallback: first floating-point parameter dtype.
+        for param in self.model.parameters():
+            if torch.is_floating_point(param):
+                return param.dtype
+
+        # 3) Final fallback for safety (should not happen for this model).
+        return torch.float32
 
     def _load_checkpoint(self, ckpt_path: str) -> None:
         resolved_ckpt_path = _resolve_checkpoint_path(ckpt_path)
@@ -207,7 +260,18 @@ class UniVLALAMStage2Encoder(nn.Module):
 
     @torch.no_grad()
     def encode(self, videos: torch.Tensor) -> Dict[str, torch.Tensor]:
-        outputs = self.model.vq_encode(videos)
+        # Keep teacher input dtype aligned with encoder LayerNorm dtype to avoid
+        # Float/BFloat16 mismatches in mixed-precision eval/training.
+        target_dtype = self._get_encoder_runtime_dtype()
+        videos = videos.to(device=self.device, dtype=target_dtype)
+        vq_states = self._set_vq_modules_training(True)
+        try:
+            # Run vendor LAM encode outside autocast so LayerNorm/input dtypes
+            # remain consistent even when outer training uses bf16 autocast.
+            with torch.amp.autocast(device_type=self.device.type, enabled=False):
+                outputs = self.model.vq_encode(videos)
+        finally:
+            self._restore_vq_modules_training(vq_states)
         return {
             "indices": outputs["indices"],
             "z_q": outputs["z_q"],

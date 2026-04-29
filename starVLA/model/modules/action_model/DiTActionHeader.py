@@ -2,16 +2,14 @@
 # Modified by [Jinhui YE/ HKUST University] in [2025]. 
 # Modification: [add global config ].
 """
-Diffusion-based action prediction head (DiT variant).
+DiT-based flow matching action prediction head.
 
 Provides:
-  - Size presets (S/B/L) for transformer-based temporal action diffusion backbone
-  - ActionModel: wraps diffusion process (training + optional DDIM sampling creation)
+  - Size presets (S/B/L) for transformer-based temporal action backbone
+  - ActionModel: standard flow matching training and Euler integration sampling
 """
 
 from starVLA.model.modules.action_model.DiT_modules.models import DiT
-from starVLA.model.modules.action_model import create_diffusion
-from .DiT_modules import gaussian_diffusion as gd
 
 import torch
 from torch import nn
@@ -64,17 +62,15 @@ DiT_models = {"DiT-S": DiT_S, "DiT-B": DiT_B, "DiT-L": DiT_L}
 # Create ActionModel
 class ActionModel(nn.Module):
     """
-    Diffusion temporal action head.
+    DiT temporal action head trained with standard flow matching.
 
     Components:
-        - DiT transformer backbone (token-wise denoiser)
-        - Gaussian diffusion scheduler (noise forward/backward)
-        - Optional DDIM sampler (created lazily)
+        - DiT transformer backbone (token-wise velocity predictor)
 
     Responsibilities:
-        - Forward: add noise + predict denoised residual
-        - loss(): simple MSE on noise prediction
-        - create_ddim(): build deterministic sampler
+        - Forward: sample interpolation time and predict velocity field
+        - loss(): MSE on velocity prediction
+        - sample_actions(): Euler integration from noise to action trajectory
     """
 
     def __init__(
@@ -86,6 +82,7 @@ class ActionModel(nn.Module):
         past_action_window_size,
         diffusion_steps=100,
         noise_schedule="squaredcos_cap_v2",
+        t_eps=1.0e-3,
     ):
         """
         Initialize diffusion model and backbone.
@@ -96,40 +93,31 @@ class ActionModel(nn.Module):
             in_channels: Action dimensionality (per timestep).
             future_action_window_size: Number of future steps modeled.
             past_action_window_size: Number of past steps possibly encoded (for context).
-            diffusion_steps: Total diffusion timesteps.
-            noise_schedule: Scheduler type string.
+            diffusion_steps: Used as the number of timestep buckets for conditioning.
+            noise_schedule: Retained for backward-compatible config surface.
+            t_eps: Clamp to avoid degeneracy near t=1 during training.
         """
         super().__init__()
         self.in_channels = in_channels
         self.noise_schedule = noise_schedule
-        # GaussianDiffusion offers forward and backward functions q_sample and p_sample.
         self.diffusion_steps = diffusion_steps
-        self.diffusion = create_diffusion(
-            timestep_respacing="",
-            noise_schedule=noise_schedule,
-            diffusion_steps=self.diffusion_steps,
-            sigma_small=True,
-            learn_sigma=False,
-        )
-        self.ddim_diffusion = None
-        if self.diffusion.model_var_type in [gd.ModelVarType.LEARNED, gd.ModelVarType.LEARNED_RANGE]:
-            learn_sigma = True
-        else:
-            learn_sigma = False
+        self.num_timestep_buckets = diffusion_steps
+        self.t_eps = float(t_eps)
         self.past_action_window_size = past_action_window_size
         self.future_action_window_size = future_action_window_size
+        self.action_horizon = future_action_window_size + past_action_window_size + 1
         self.token_size = action_hidden_dim  # QFormer output size
         self.net = DiT_models[model_type](
             in_channels=in_channels,
             class_dropout_prob=0.1,
-            learn_sigma=learn_sigma,
+            learn_sigma=False,
             future_action_window_size=future_action_window_size,
             past_action_window_size=past_action_window_size,
         )
 
     def forward(self, gt_action, condition, **kwargs):
         """
-        Perform one diffusion training step.
+        Perform one flow matching training step.
 
         Args:
             gt_action: Ground truth action tensor [B, T, C].
@@ -138,59 +126,79 @@ class ActionModel(nn.Module):
 
         Returns:
             tuple:
-                noise_pred: Predicted noise tensor.
-                noise: Sampled noise tensor.
-                timestep: Timesteps used per batch element.
+                pred_velocity: Predicted velocity tensor.
+                target_velocity: Target velocity tensor.
+                timestep: Discrete timesteps used for conditioning.
         """
-        # sample random noise and timestep
-        noise = torch.randn_like(gt_action)  # [B, T, C]
-        timestep = torch.randint(0, self.diffusion.num_timesteps, (gt_action.size(0),), device=gt_action.device)
+        del kwargs
+        noise = torch.randn_like(gt_action)
+        t_cont = torch.rand((gt_action.size(0),), device=gt_action.device, dtype=gt_action.dtype)
+        if self.t_eps > 0:
+            t_cont = t_cont.clamp(min=self.t_eps, max=1.0 - self.t_eps)
+        t_broadcast = t_cont[:, None, None]
+        noisy_trajectory = (1.0 - t_broadcast) * noise + t_broadcast * gt_action
+        target_velocity = gt_action - noise
+        timestep = (t_cont * (self.num_timestep_buckets - 1)).long()
 
-        # sample x_t from x
-        x_t = self.diffusion.q_sample(gt_action, timestep, noise)
+        pred_velocity = self.net(noisy_trajectory, timestep, condition)
+        assert pred_velocity.shape == target_velocity.shape == gt_action.shape
 
-        # predict noise from x_t
-        noise_pred = self.net(x_t, timestep, condition)
+        return pred_velocity, target_velocity, timestep
 
-        assert noise_pred.shape == noise.shape == gt_action.shape
-
-        return noise_pred, noise, timestep
-
-    def loss(self, noise_pred, noise):
+    def loss(self, pred_velocity, target_velocity):
         """
-        Compute MSE noise prediction loss.
+        Compute MSE velocity prediction loss.
 
         Args:
-            noise_pred: Predicted noise tensor.
-            noise: Target noise tensor.
+            pred_velocity: Predicted velocity tensor.
+            target_velocity: Target velocity tensor.
 
         Returns:
             torch.Tensor: Scalar loss.
         """
-        # Compute L2 loss
-        loss = ((noise_pred - noise) ** 2).mean()
-        # Optional: loss += loss_vlb
+        return ((pred_velocity - target_velocity) ** 2).mean()
 
-        return loss
+    @torch.no_grad()
+    def sample_actions(self, condition, cfg_scale: float = 1.0, num_steps: int = 10):
+        """Sample actions with Euler integration under the learned velocity field."""
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
 
-    def create_ddim(self, ddim_step=10):
-        """
-        Lazily create DDIM sampler instance.
+        batch_size = condition.shape[0]
+        device = condition.device
+        model_dtype = next(self.net.parameters()).dtype
+        condition = condition.to(device=device, dtype=model_dtype)
 
-        Args:
-            ddim_step: Number of DDIM steps.
-
-        Returns:
-            Diffusion: DDIM diffusion object.
-        """
-        self.ddim_diffusion = create_diffusion(
-            timestep_respacing="ddim" + str(ddim_step),
-            noise_schedule=self.noise_schedule,
-            diffusion_steps=self.diffusion_steps,
-            sigma_small=True,
-            learn_sigma=False,
+        actions = torch.randn(
+            batch_size,
+            self.action_horizon,
+            self.in_channels,
+            device=device,
+            dtype=model_dtype,
         )
-        return self.ddim_diffusion
+        dt = 1.0 / float(num_steps)
+        using_cfg = cfg_scale > 1.0 and hasattr(self.net, "forward_with_cfg") and hasattr(self.net, "z_embedder")
+
+        for step_idx in range(num_steps):
+            t_cont = float(step_idx) / float(num_steps)
+            timestep = torch.full(
+                (batch_size,),
+                int(t_cont * (self.num_timestep_buckets - 1)),
+                device=device,
+                dtype=torch.long,
+            )
+            if using_cfg:
+                uncondition = self.net.z_embedder.uncondition.to(device=device, dtype=model_dtype)
+                uncondition = uncondition.unsqueeze(0).expand(batch_size, -1, -1)
+                model_input = torch.cat([actions, actions], dim=0)
+                z = torch.cat([condition, uncondition], dim=0)
+                pred_velocity = self.net.forward_with_cfg(model_input, timestep.repeat(2), z, cfg_scale)
+                pred_velocity, _ = pred_velocity.chunk(2, dim=0)
+            else:
+                pred_velocity = self.net(actions, timestep, condition)
+            actions = actions + dt * pred_velocity
+
+        return actions
 
 
 def get_action_model(model_typ="DiT-B", config=None):
